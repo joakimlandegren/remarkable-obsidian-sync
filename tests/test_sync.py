@@ -1,5 +1,8 @@
 import json
 import os
+import shutil
+import tempfile
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -132,3 +135,35 @@ def test_list_notebooks_auth_failure():
         mock_run.return_value = MagicMock(returncode=1, stderr="auth error")
         with pytest.raises(SystemExit):
             list_notebooks("rmapi", "/")
+
+
+# --- rmapi export tests ---
+
+from remarkable_to_obsidian import export_notebook_pdf
+
+
+def test_export_notebook_pdf(tmp_path):
+    """Exports a notebook PDF to a temp directory."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    def mock_run(cmd, **kwargs):
+        # rmapi geta writes a PDF named after the notebook into the -o dir
+        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else "."
+        (Path(out) / "Meeting Notes.pdf").write_bytes(b"%PDF-1.4 fake content")
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        pdf_path = export_notebook_pdf("rmapi", "/Meeting Notes", "Meeting Notes", output_dir)
+
+    assert pdf_path.exists()
+    assert pdf_path.name == "Meeting Notes.pdf"
+
+
+def test_export_notebook_pdf_failure():
+    """Returns None when rmapi geta fails."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=1, stderr="export error")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = export_notebook_pdf("rmapi", "/Notebook", "Notebook", Path(tmp))
+    assert result is None

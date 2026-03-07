@@ -72,3 +72,25 @@ def _walk_directory(rmapi_bin: str, path: str, notebooks: list[dict]) -> None:
             })
         elif entry["type"] == "CollectionType":
             _walk_directory(rmapi_bin, full_path, notebooks)
+
+
+def export_notebook_pdf(rmapi_bin: str, notebook_path: str, name: str, output_dir: Path) -> Path | None:
+    """Export a notebook as annotated PDF using rmapi geta. Returns path to PDF or None on failure."""
+    result = subprocess.run(
+        [rmapi_bin, "geta", "-o", str(output_dir), notebook_path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        log.error("Failed to export %s: %s", notebook_path, result.stderr)
+        return None
+
+    pdf_path = output_dir / f"{name}.pdf"
+    if not pdf_path.exists():
+        # rmapi may use a slightly different name; find any PDF in the dir
+        pdfs = list(output_dir.glob("*.pdf"))
+        if pdfs:
+            pdf_path = pdfs[0]
+        else:
+            log.error("No PDF found after exporting %s", notebook_path)
+            return None
+    return pdf_path
