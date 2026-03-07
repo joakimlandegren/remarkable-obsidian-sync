@@ -1,5 +1,6 @@
 """Sync reMarkable handwritten notebooks to Obsidian via Claude vision."""
 
+import base64
 import json
 import logging
 import os
@@ -94,3 +95,39 @@ def export_notebook_pdf(rmapi_bin: str, notebook_path: str, name: str, output_di
             log.error("No PDF found after exporting %s", notebook_path)
             return None
     return pdf_path
+
+
+TRANSCRIPTION_PROMPT = """Transcribe all handwritten text in this document to clean markdown.
+
+Rules:
+- Infer structure: use headings, bullet lists, numbered lists as appropriate
+- Describe diagrams or sketches in blockquotes: > [Diagram: description]
+- Mark illegible sections as *[illegible]*
+- Output ONLY the markdown transcription, no preamble or explanation"""
+
+
+def transcribe_pdf(client, pdf_path: Path, model: str) -> str:
+    """Send a PDF to Claude for handwriting transcription. Returns markdown string."""
+    pdf_data = base64.standard_b64encode(pdf_path.read_bytes()).decode("utf-8")
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=16384,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_data,
+                        },
+                    },
+                    {"type": "text", "text": TRANSCRIPTION_PROMPT},
+                ],
+            }
+        ],
+    )
+    return message.content[0].text

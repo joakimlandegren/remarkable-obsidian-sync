@@ -167,3 +167,33 @@ def test_export_notebook_pdf_failure():
         with tempfile.TemporaryDirectory() as tmp:
             result = export_notebook_pdf("rmapi", "/Notebook", "Notebook", Path(tmp))
     assert result is None
+
+
+# --- Transcription tests ---
+
+from remarkable_to_obsidian import transcribe_pdf
+
+
+def test_transcribe_pdf(tmp_path):
+    """Sends PDF to Claude and returns markdown transcription."""
+    fake_pdf = tmp_path / "test.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake")
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="# Meeting Notes\n\n- Item 1\n- Item 2")]
+    mock_client.messages.create.return_value = mock_response
+
+    result = transcribe_pdf(mock_client, fake_pdf, "claude-opus-4-6")
+
+    assert result == "# Meeting Notes\n\n- Item 1\n- Item 2"
+
+    # Verify the API call structure
+    call_args = mock_client.messages.create.call_args
+    assert call_args.kwargs["model"] == "claude-opus-4-6"
+    assert call_args.kwargs["max_tokens"] == 16384
+    messages = call_args.kwargs["messages"]
+    assert len(messages) == 1
+    content = messages[0]["content"]
+    assert content[0]["type"] == "document"
+    assert content[0]["source"]["media_type"] == "application/pdf"
