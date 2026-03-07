@@ -1,0 +1,16 @@
+[project]
+name = "remarkable-obsidian-sync"
+version = "0.1.0"
+description = "Sync reMarkable handwritten notebooks to Obsidian via Claude vision"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.40.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["remarkable_to_obsidian.py"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
