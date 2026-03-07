@@ -233,3 +233,46 @@ def test_write_obsidian_note(tmp_path):
     assert "- inbox" in content
     assert content.endswith("- Discussed roadmap\n")
     assert "Inbox/reMarkable" in str(path.parent)
+
+
+# --- Sync orchestration tests ---
+
+from remarkable_to_obsidian import sync_notebooks
+
+
+def test_sync_skips_unchanged(tmp_path, capsys):
+    """Skips notebooks whose version matches state."""
+    notebooks = [
+        {"id": "abc-123", "name": "Old Notes", "version": 3, "modified": "2025-01-15T10:30:00Z", "path": "/Old Notes"},
+    ]
+    state = {"abc-123": 3}  # Same version — should skip
+
+    with patch("remarkable_to_obsidian.export_notebook_pdf") as mock_export:
+        sync_notebooks(notebooks, state, "/tmp/vault", "rmapi", "claude-opus-4-6", dry_run=False, client=MagicMock(), state_file="/tmp/state.json")
+        mock_export.assert_not_called()
+
+
+def test_sync_processes_new_notebook(tmp_path):
+    """Processes notebooks not in state."""
+    notebooks = [
+        {"id": "new-1", "name": "New Notes", "version": 1, "modified": "2025-01-20T09:00:00Z", "path": "/New Notes"},
+    ]
+    state = {}
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="# New Notes\n\nContent here")]
+    mock_client.messages.create.return_value = mock_response
+
+    fake_pdf = tmp_path / "New Notes.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake")
+
+    with patch("remarkable_to_obsidian.export_notebook_pdf", return_value=fake_pdf) as mock_export, \
+         patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
+         patch("remarkable_to_obsidian.save_state") as mock_save, \
+         patch("tempfile.mkdtemp", return_value=str(tmp_path)):
+        sync_notebooks(notebooks, state, str(tmp_path / "vault"), "rmapi", "claude-opus-4-6", dry_run=False, client=mock_client, state_file="/tmp/state.json")
+
+    mock_export.assert_called_once()
+    mock_write.assert_called_once()
+    assert state["new-1"] == 1  # State updated

@@ -1,12 +1,15 @@
 """Sync reMarkable handwritten notebooks to Obsidian via Claude vision."""
 
+import argparse
 import base64
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -165,3 +168,73 @@ def write_obsidian_note(vault_path: str, notebook: dict, markdown: str) -> Path:
     note_path = inbox / filename
     note_path.write_text(frontmatter + "\n" + markdown + "\n")
     return note_path
+
+
+def sync_notebooks(
+    notebooks: list[dict],
+    state: dict,
+    vault_path: str,
+    rmapi_bin: str,
+    model: str,
+    dry_run: bool,
+    client,
+    state_file: str,
+) -> None:
+    """Process each notebook: skip unchanged, export, transcribe, write."""
+    for nb in notebooks:
+        if state.get(nb["id"]) == nb["version"]:
+            log.info("Skipping %s (unchanged, version %s)", nb["name"], nb["version"])
+            continue
+
+        log.info("Processing: %s", nb["name"])
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            pdf_path = export_notebook_pdf(rmapi_bin, nb["path"], nb["name"], tmp_dir)
+            if pdf_path is None:
+                continue
+
+            if dry_run:
+                log.info("[DRY RUN] Would transcribe %s (%d bytes)", nb["name"], pdf_path.stat().st_size)
+                continue
+
+            markdown = transcribe_pdf(client, pdf_path, model)
+            note_path = write_obsidian_note(vault_path, nb, markdown)
+            log.info("Wrote %s (%d chars)", note_path, len(markdown))
+
+            state[nb["id"]] = nb["version"]
+            save_state(state_file, state)
+        except Exception:
+            log.error("Failed to process %s", nb["name"], exc_info=True)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync reMarkable notebooks to Obsidian")
+    parser.add_argument("--dry-run", action="store_true", help="Preview without writing files")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-7s  %(message)s",
+    )
+
+    config = load_config()
+    state = load_state(config["state_file"])
+
+    log.info("Starting reMarkable sync (watch: %s)", config["watch_path"])
+    notebooks = list_notebooks(config["rmapi_bin"], config["watch_path"])
+    log.info("Found %d notebooks", len(notebooks))
+
+    import anthropic
+    client = anthropic.Anthropic() if not args.dry_run else None
+    sync_notebooks(
+        notebooks, state, config["obsidian_vault"], config["rmapi_bin"],
+        config["model"], args.dry_run, client, config["state_file"],
+    )
+
+    log.info("Sync complete.")
+
+
+if __name__ == "__main__":
+    main()
