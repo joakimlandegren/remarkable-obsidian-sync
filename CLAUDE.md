@@ -75,6 +75,10 @@ RM_STATE_FILE=/tmp/state_1.json uv run python remarkable_to_obsidian.py --notebo
 uv run python remarkable_to_obsidian.py --merge-states /tmp/state_*.json
 ```
 
+## Automatic sync
+
+`sync.sh` + launchd plist for hourly sync during daytime (8am–10pm). The plist lives at `~/Library/LaunchAgents/com.remarkable.obsidian-sync.plist`. Manage with `launchctl load/unload/start`. Logs: `/tmp/rm_sync.log`.
+
 ## Testing
 
 ```bash

@@ -149,6 +149,33 @@ The tool tracks sync state per-page using SHA-256 hashes of the raw `.rm` stroke
 
 This minimizes API usage and sync time.
 
+## Automatic sync (macOS)
+
+Set up hourly sync during daytime using launchd:
+
+```bash
+# Copy the plist to LaunchAgents
+cp com.remarkable.obsidian-sync.plist ~/Library/LaunchAgents/
+
+# Load it
+launchctl load ~/Library/LaunchAgents/com.remarkable.obsidian-sync.plist
+```
+
+The included `sync.sh` wrapper runs the sync hourly between 8am and 10pm. Logs go to `/tmp/rm_sync.log`.
+
+```bash
+# Run immediately
+launchctl start com.remarkable.obsidian-sync
+
+# Stop
+launchctl unload ~/Library/LaunchAgents/com.remarkable.obsidian-sync.plist
+
+# Check logs
+cat /tmp/rm_sync.log
+```
+
+Edit `sync.sh` to adjust the time window.
+
 ## Running tests
 
 ```bash
