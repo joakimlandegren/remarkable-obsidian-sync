@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import fnmatch
 import hashlib
 import io
 import json
@@ -12,10 +13,8 @@ import shutil
 import struct
 import subprocess
 import sys
-import fnmatch
 import tempfile
 import zipfile
-from datetime import datetime
 from pathlib import Path
 
 from rmscene import read_blocks, SceneLineItemBlock
@@ -459,7 +458,9 @@ def _svg_to_png(svg_path: Path) -> bytes:
         scale = min(MAX_IMAGE_DIM / svg_height, MAX_IMAGE_DIM / svg_width)
         output_width = int(svg_width * scale)
 
-    return cairosvg.svg2png(url=str(svg_path), output_width=output_width)
+    result = cairosvg.svg2png(url=str(svg_path), output_width=output_width)
+    assert isinstance(result, bytes)
+    return result
 
 
 def _encode_page_image(page_path: Path) -> tuple[str, str]:
@@ -977,8 +978,12 @@ def main():
         import anthropic
         if os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1":
             from anthropic import AnthropicVertex
+            project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
+            if not project_id:
+                log.error("ANTHROPIC_VERTEX_PROJECT_ID must be set for Vertex AI")
+                sys.exit(1)
             client = AnthropicVertex(
-                project_id=os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"),
+                project_id=project_id,
                 region=os.environ.get("CLOUD_ML_REGION", "europe-west1"),
             )
         else:

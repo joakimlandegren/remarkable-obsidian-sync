@@ -1,15 +1,40 @@
 import base64
 import hashlib
-import io
 import json
 import os
 import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
 import pytest
+
+from remarkable_to_obsidian import (
+    DIAGRAM_RE,
+    _encode_page_image,
+    _extract_rm_pages,
+    _hash_file,
+    _load_dotenv,
+    _svg_to_png,
+    export_notebook,
+    export_notebook_pdf,
+    extract_diagram_crops,
+    is_ignored,
+    list_notebooks,
+    load_config,
+    load_ignore_patterns,
+    load_state,
+    merge_state_files,
+    sanitize_filename,
+    save_source_pages,
+    save_state,
+    sync_notebooks,
+    transcribe_page,
+    transcribe_pages,
+    transcribe_pdf,
+    write_obsidian_note,
+)
 
 
 def test_config_defaults():
@@ -17,8 +42,6 @@ def test_config_defaults():
     # Clear any env vars that might be set
     for var in ["OBSIDIAN_VAULT", "RMAPI_BIN", "RM_STATE_FILE", "RM_WATCH_PATH", "RM_MODEL"]:
         os.environ.pop(var, None)
-
-    from remarkable_to_obsidian import load_config
 
     config = load_config()
     assert config["obsidian_vault"].endswith("obsidian-vault")
@@ -36,8 +59,6 @@ def test_config_from_env(monkeypatch):
     monkeypatch.setenv("RM_WATCH_PATH", "/Notes")
     monkeypatch.setenv("RM_MODEL", "claude-sonnet-4-20250514")
 
-    from remarkable_to_obsidian import load_config
-
     config = load_config()
     assert config["obsidian_vault"] == "/tmp/test-vault"
     assert config["rmapi_bin"] == "/usr/local/bin/rmapi"
@@ -47,8 +68,6 @@ def test_config_from_env(monkeypatch):
 
 
 # --- State management tests ---
-
-from remarkable_to_obsidian import load_state, save_state
 
 
 def test_load_state_missing_file(tmp_path):
@@ -82,8 +101,6 @@ def test_load_state_corrupt_file(tmp_path):
 
 
 # --- rmapi listing tests ---
-
-from remarkable_to_obsidian import list_notebooks
 
 
 def _mock_rmapi_find_stat(notebooks_by_path: dict[str, dict]):
@@ -179,8 +196,6 @@ def test_list_notebooks_auth_failure():
 
 # --- rmapi export tests ---
 
-from remarkable_to_obsidian import export_notebook_pdf
-
 
 def test_export_notebook_pdf(tmp_path):
     """Exports a notebook PDF to a temp directory."""
@@ -196,6 +211,7 @@ def test_export_notebook_pdf(tmp_path):
     with patch("subprocess.run", side_effect=mock_run):
         pdf_path = export_notebook_pdf("rmapi", "/Meeting Notes", "Meeting Notes", output_dir)
 
+    assert pdf_path is not None
     assert pdf_path.exists()
     assert pdf_path.name == "Meeting Notes.pdf"
 
@@ -210,8 +226,6 @@ def test_export_notebook_pdf_failure():
 
 
 # --- Transcription tests ---
-
-from remarkable_to_obsidian import transcribe_pdf
 
 
 def test_transcribe_pdf(tmp_path):
@@ -240,8 +254,6 @@ def test_transcribe_pdf(tmp_path):
 
 
 # --- Obsidian writer tests ---
-
-from remarkable_to_obsidian import sanitize_filename, write_obsidian_note
 
 
 def test_sanitize_filename():
@@ -278,8 +290,6 @@ def test_write_obsidian_note(tmp_path):
 
 
 # --- Sync orchestration tests ---
-
-from remarkable_to_obsidian import sync_notebooks
 
 
 def test_sync_skips_unchanged(tmp_path, capsys):
@@ -323,7 +333,7 @@ def test_sync_processes_new_notebook(tmp_path):
 
     with patch("remarkable_to_obsidian._extract_rm_pages", return_value=None) as mock_extract, \
          patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
-         patch("remarkable_to_obsidian.save_state") as mock_save, \
+         patch("remarkable_to_obsidian.save_state"), \
          patch("tempfile.mkdtemp", return_value=str(tmp_path)):
         sync_notebooks(notebooks, state, str(tmp_path / "vault"), "rmapi", "claude-opus-4-6", dry_run=False, client=mock_client, state_file="/tmp/state.json")
 
@@ -385,8 +395,6 @@ def test_sync_incremental_pages(tmp_path):
 
 # --- .env loading tests ---
 
-from remarkable_to_obsidian import _load_dotenv
-
 
 def test_load_dotenv_loads_vars(tmp_path, monkeypatch):
     """Loads variables from .env file."""
@@ -442,17 +450,11 @@ def test_load_dotenv_ignores_comments_and_blanks(tmp_path):
 
 # --- .sync_ignore tests ---
 
-from remarkable_to_obsidian import load_ignore_patterns, is_ignored
-
 
 def test_load_ignore_patterns(tmp_path):
     """Loads patterns from .sync_ignore file."""
     ignore_file = tmp_path / ".sync_ignore"
     ignore_file.write_text("# comment\nKvitto*\n\nFinancial Core*\n")
-
-    with patch("remarkable_to_obsidian.Path") as MockPath:
-        # We need to mock Path(__file__).parent / ".sync_ignore"
-        pass
 
     # Test the logic directly
     patterns = []
@@ -496,8 +498,6 @@ def test_is_ignored_no_match():
 
 
 # --- Batch operations tests ---
-
-from remarkable_to_obsidian import merge_state_files
 
 
 def test_merge_state_files(tmp_path):
@@ -546,8 +546,6 @@ def test_merge_state_files_empty_source(tmp_path):
 
 # --- Hash file tests ---
 
-from remarkable_to_obsidian import _hash_file
-
 
 def test_hash_file(tmp_path):
     """Returns consistent SHA-256 hex digest."""
@@ -560,8 +558,6 @@ def test_hash_file(tmp_path):
 
 
 # --- Image encoding tests ---
-
-from remarkable_to_obsidian import _encode_page_image
 
 
 def test_encode_page_image_png(tmp_path):
@@ -597,8 +593,6 @@ def test_encode_page_image_svg(tmp_path):
 
 # --- SVG to PNG tests ---
 
-from remarkable_to_obsidian import _svg_to_png, MAX_IMAGE_DIM
-
 
 def test_svg_to_png_normal_dimensions(tmp_path):
     """Uses original width when dimensions are within limits."""
@@ -618,7 +612,7 @@ def test_svg_to_png_oversized(tmp_path):
     svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="1404" height="10000"></svg>')
 
     with patch("cairosvg.svg2png", return_value=b"png_bytes") as mock_cairo:
-        result = _svg_to_png(svg)
+        _svg_to_png(svg)
 
     # Scale = min(8000/10000, 8000/1404) = 0.8
     expected_width = int(1404 * 0.8)
@@ -626,8 +620,6 @@ def test_svg_to_png_oversized(tmp_path):
 
 
 # --- Transcription tests (page-level) ---
-
-from remarkable_to_obsidian import transcribe_page, transcribe_pages
 
 
 def test_transcribe_page(tmp_path):
@@ -675,8 +667,6 @@ def test_transcribe_pages_multiple(tmp_path):
 
 
 # --- Diagram extraction tests ---
-
-from remarkable_to_obsidian import extract_diagram_crops, DIAGRAM_RE
 
 
 def test_diagram_regex():
@@ -731,8 +721,6 @@ def test_extract_diagram_crops_success(tmp_path):
 
 # --- Save source pages tests ---
 
-from remarkable_to_obsidian import save_source_pages
-
 
 def test_save_source_pages_pdf(tmp_path):
     """PDF files are copied with notebook name."""
@@ -779,8 +767,6 @@ def test_save_source_pages_svg(tmp_path):
 
 
 # --- Extract .rm pages tests ---
-
-from remarkable_to_obsidian import _extract_rm_pages
 
 
 def test_extract_rm_pages_pdf(tmp_path):
@@ -829,6 +815,7 @@ def test_extract_rm_pages_zip_with_content(tmp_path):
     with patch("subprocess.run", side_effect=mock_run):
         result = _extract_rm_pages("rmapi", "/Notebook", output)
 
+    assert result is not None
     assert len(result) == 2
     assert result[0].stem == "page-a"  # ordered by .content
     assert result[1].stem == "page-b"
@@ -869,8 +856,6 @@ def test_extract_rm_pages_no_output(tmp_path):
 
 
 # --- Export notebook tests ---
-
-from remarkable_to_obsidian import export_notebook
 
 
 def test_export_notebook_pdf_based(tmp_path):
