@@ -17,7 +17,7 @@ def test_config_defaults():
     from remarkable_to_obsidian import load_config
 
     config = load_config()
-    assert config["obsidian_vault"].endswith("joakimlandegren")
+    assert config["obsidian_vault"].endswith("obsidian-vault")
     assert config["rmapi_bin"] == "rmapi"
     assert config["state_file"].endswith(".remarkable_sync_state.json")
     assert config["watch_path"] == "/"

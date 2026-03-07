@@ -29,10 +29,7 @@ def load_config() -> dict:
     """Load configuration from environment variables with defaults."""
     home = Path.home()
     return {
-        "obsidian_vault": os.environ.get(
-            "OBSIDIAN_VAULT",
-            str(home / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "joakimlandegren"),
-        ),
+        "obsidian_vault": os.environ.get("OBSIDIAN_VAULT", str(home / "obsidian-vault")),
         "rmapi_bin": os.environ.get("RMAPI_BIN", "rmapi"),
         "state_file": os.environ.get("RM_STATE_FILE", str(home / ".remarkable_sync_state.json")),
         "watch_path": os.environ.get("RM_WATCH_PATH", "/"),
@@ -719,7 +716,7 @@ def main():
         if os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1":
             from anthropic import AnthropicVertex
             client = AnthropicVertex(
-                project_id=os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "spotify-claude-code-trial"),
+                project_id=os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"),
                 region=os.environ.get("CLOUD_ML_REGION", "europe-west1"),
             )
         else:

@@ -4,25 +4,27 @@ Syncs handwritten reMarkable notebooks to Obsidian as markdown via Claude vision
 
 ## Obsidian vault
 
-The default Obsidian vault is at:
-`~/Library/Mobile Documents/iCloud~md~obsidian/Documents/joakimlandegren`
-
-Vault name: `joakimlandegren`
+Set `OBSIDIAN_VAULT` to your vault path. Default: `~/obsidian-vault`.
 
 To open a file in Obsidian (not the default text editor), use the Obsidian URI scheme:
 ```
-open "obsidian://open?vault=joakimlandegren&file=<path-within-vault>"
+open "obsidian://open?vault=VAULT_NAME&file=<path-within-vault>"
 ```
 The file path is relative to the vault root, without `.md` extension, and URL-encoded.
-Example: `open "obsidian://open?vault=joakimlandegren&file=Remarkable%20Notes%2F2026-03-07%201104%20Quick%20sheets"`
 
 ## Running
 
 ```bash
+# With Anthropic API key
+ANTHROPIC_API_KEY=sk-... \
+OBSIDIAN_VAULT=~/my-vault \
+uv run python remarkable_to_obsidian.py
+
+# With Vertex AI
 CLAUDE_CODE_USE_VERTEX=1 \
+ANTHROPIC_VERTEX_PROJECT_ID=your-project-id \
 CLOUD_ML_REGION=europe-west1 \
-ANTHROPIC_VERTEX_PROJECT_ID=spotify-claude-code-trial \
-RMAPI_BIN=~/go/bin/rmapi \
+OBSIDIAN_VAULT=~/my-vault \
 uv run python remarkable_to_obsidian.py
 ```
 
@@ -36,4 +38,4 @@ uv run pytest tests/test_sync.py -v
 
 ## Architecture
 
-Single-file script (`remarkable_to_obsidian.py`). Uses `rmapi` CLI for reMarkable cloud access, `rmscene` for parsing .rm v6 stroke files, `cairosvg` for SVG-to-PNG conversion, and Anthropic SDK (via Vertex AI) for handwriting transcription. Output goes to `Remarkable Notes/` in the vault with source page images saved to `Attachments/reMarkable/`.
+Single-file script (`remarkable_to_obsidian.py`). Uses `rmapi` CLI for reMarkable cloud access, `rmscene` for parsing .rm v6 stroke files, `cairosvg` for SVG-to-PNG conversion, and Anthropic SDK for handwriting transcription. Output goes to `Remarkable Notes/` in the vault with source page images saved to `Attachments/reMarkable/`.
