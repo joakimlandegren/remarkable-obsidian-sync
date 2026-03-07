@@ -87,4 +87,8 @@ uv run pytest tests/test_sync.py -v
 
 ## Architecture
 
-Single-file script (`remarkable_to_obsidian.py`). Uses `rmapi` CLI for reMarkable cloud access, `rmscene` for parsing .rm v6 stroke files, `cairosvg` for SVG-to-PNG conversion, and Anthropic SDK for handwriting transcription. Output goes to `Remarkable Notes/` in the vault with source page images saved to `Attachments/reMarkable/`.
+Single-file script (`remarkable_to_obsidian.py`). Uses `rmapi` CLI for reMarkable cloud access, `rmscene` for parsing .rm v6 stroke files (with built-in v5 parser for older notebooks), `cairosvg` for SVG-to-PNG conversion, and Anthropic SDK for handwriting transcription.
+
+**Output structure:** Notes preserve the reMarkable folder hierarchy under the vault root (e.g. `/1. Projects/Planning/Note` → `Remarkable Notes/1. Projects/Planning/Note.md`). Source page images go to `Attachments/reMarkable/`.
+
+**Diagram conversion:** Handwritten diagrams detected during transcription are sent to Claude a second time to be reproduced as Mermaid (flowcharts, sequences, architectures) or Excalidraw (freeform diagrams). Mermaid is embedded inline; Excalidraw is saved as `.excalidraw.md` files. The original cropped PNG is kept as fallback.

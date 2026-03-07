@@ -531,14 +531,108 @@ DIAGRAM_RE = re.compile(
     r'> \[Diagram\(page=(\d+),\s*top=(\d+),\s*bottom=(\d+)\):\s*(.+?)\]'
 )
 
+DIAGRAM_CONVERT_PROMPT = """Look at this handwritten diagram. Reproduce it as accurately as possible.
+
+First decide the best format:
+- If it's a flowchart, sequence diagram, state diagram, or architecture diagram with boxes/arrows: use Mermaid
+- If it's a freeform sketch, mind map, or drawing with arbitrary positioning: use Excalidraw JSON
+
+Rules:
+- Preserve all text labels, connections, and layout direction
+- Keep it simple and readable
+- For Mermaid: output ONLY a valid mermaid code block, no explanation
+- For Excalidraw: output ONLY valid Excalidraw JSON (the "elements" array), no explanation
+
+Start your response with exactly one of these lines:
+FORMAT: mermaid
+FORMAT: excalidraw
+
+Then output the content."""
+
+
+def _convert_diagram_to_vector(client, crop_image: bytes, model: str) -> tuple[str, str]:
+    """Send a cropped diagram image to Claude to reproduce as Mermaid or Excalidraw.
+    Returns (format, content) where format is 'mermaid' or 'excalidraw'."""
+    image_data = base64.standard_b64encode(crop_image).decode("utf-8")
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=8192,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": image_data},
+                },
+                {"type": "text", "text": DIAGRAM_CONVERT_PROMPT},
+            ],
+        }],
+    )
+
+    response = message.content[0].text.strip()
+    lines = response.split("\n", 1)
+
+    if lines[0].startswith("FORMAT: mermaid"):
+        content = lines[1].strip() if len(lines) > 1 else ""
+        # Strip outer ```mermaid fences if present
+        content = re.sub(r'^```mermaid\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        return "mermaid", content
+    elif lines[0].startswith("FORMAT: excalidraw"):
+        content = lines[1].strip() if len(lines) > 1 else ""
+        # Strip outer ```json fences if present
+        content = re.sub(r'^```json\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        return "excalidraw", content
+    else:
+        # Fallback: try to detect from content
+        if "```mermaid" in response or "graph " in response or "flowchart " in response:
+            content = re.sub(r'^```mermaid\s*\n?', '', response)
+            content = re.sub(r'\n?```\s*$', '', content)
+            return "mermaid", content
+        return "excalidraw", response
+
+
+def _write_excalidraw_file(elements_json: str, file_path: Path, description: str) -> None:
+    """Write an Excalidraw .excalidraw.md file for Obsidian."""
+    # Parse elements, wrapping in full Excalidraw structure if needed
+    try:
+        elements = json.loads(elements_json)
+        if isinstance(elements, dict) and "elements" in elements:
+            elements = elements["elements"]
+    except json.JSONDecodeError:
+        elements = []
+
+    excalidraw_data = {
+        "type": "excalidraw",
+        "version": 2,
+        "source": "remarkable-obsidian-sync",
+        "elements": elements,
+        "appState": {"gridSize": None, "viewBackgroundColor": "#ffffff"},
+        "files": {},
+    }
+
+    content = (
+        "---\n\nexcalidraw-plugin: parsed\ntags: [excalidraw]\n\n---\n"
+        "==⚠  Switch to EXCALIDRAW VIEW in the MORE OPTIONS menu of this document. ⚠==\n\n\n"
+        f"# Text Elements\n{description}\n\n"
+        "%%\n# Drawing\n```json\n"
+        + json.dumps(excalidraw_data, indent=2)
+        + "\n```\n%%"
+    )
+    file_path.write_text(content)
+
 
 def extract_diagram_crops(
     markdown: str,
     page_paths: list[Path],
     vault_path: str,
     notebook_name: str,
+    client=None,
+    model: str = "",
 ) -> tuple[str, list[str]]:
-    """Find Diagram markers in markdown, crop source images, return updated markdown and saved filenames."""
+    """Find Diagram markers in markdown, convert to Mermaid/Excalidraw, return updated markdown and saved filenames."""
     from PIL import Image
 
     attachments = Path(vault_path) / "Attachments" / "reMarkable"
@@ -576,12 +670,36 @@ def extract_diagram_crops(
             cropped = img.crop((0, y_top, width, y_bottom))
 
             crop_counter += 1
+
+            # Save cropped PNG for reference
+            buf = io.BytesIO()
+            cropped.save(buf, "PNG")
+            crop_bytes = buf.getvalue()
+
             crop_name = f"{safe_name} - diagram {crop_counter}.png"
             crop_path = attachments / crop_name
-            cropped.save(str(crop_path), "PNG")
+            crop_path.write_bytes(crop_bytes)
             saved_crops.append(crop_name)
             log.info("Cropped diagram %d from page %d (%d%%-%d%%)", crop_counter, page_num, top_pct, bottom_pct)
 
+            # Convert to vector format if client available
+            if client and model:
+                try:
+                    fmt, content = _convert_diagram_to_vector(client, crop_bytes, model)
+                    if fmt == "mermaid" and content.strip():
+                        log.info("Converted diagram %d to Mermaid", crop_counter)
+                        return f"> *{description}*\n\n```mermaid\n{content}\n```"
+                    elif fmt == "excalidraw" and content.strip():
+                        excalidraw_name = f"{safe_name} - diagram {crop_counter}.excalidraw.md"
+                        excalidraw_path = attachments / excalidraw_name
+                        _write_excalidraw_file(content, excalidraw_path, description)
+                        saved_crops.append(excalidraw_name)
+                        log.info("Converted diagram %d to Excalidraw", crop_counter)
+                        return f"> *{description}*\n\n![[{excalidraw_name}]]"
+                except Exception:
+                    log.warning("Failed to convert diagram %d to vector, using image", crop_counter, exc_info=True)
+
+            # Fallback: embed cropped image
             return f"> *{description}*\n\n![[{crop_name}]]"
         except Exception:
             log.warning("Failed to crop diagram from page %d", page_num, exc_info=True)
@@ -702,7 +820,7 @@ def sync_notebooks(
                     log.info("[DRY RUN] Would transcribe %s (PDF, %d bytes)", nb["name"], pdfs[0].stat().st_size)
                     continue
                 markdown = transcribe_pdf(client, pdfs[0], model)
-                markdown, _ = extract_diagram_crops(markdown, pdfs, vault_path, nb["name"])
+                markdown, _ = extract_diagram_crops(markdown, pdfs, vault_path, nb["name"], client=client, model=model)
                 source_files = save_source_pages(vault_path, nb, pdfs)
                 note_path = write_obsidian_note(vault_path, nb, markdown, source_files)
                 log.info("Wrote %s (%d chars)", note_path, len(markdown))
@@ -767,7 +885,7 @@ def sync_notebooks(
             markdown = "\n\n---\n\n".join(all_parts)
 
             # Extract and crop any diagram regions
-            markdown, _ = extract_diagram_crops(markdown, svg_paths, vault_path, nb["name"])
+            markdown, _ = extract_diagram_crops(markdown, svg_paths, vault_path, nb["name"], client=client, model=model)
 
             source_files = save_source_pages(vault_path, nb, svg_paths)
             note_path = write_obsidian_note(vault_path, nb, markdown, source_files)

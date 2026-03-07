@@ -5,11 +5,12 @@ Sync handwritten [reMarkable](https://remarkable.com/) notebooks to [Obsidian](h
 ## What it does
 
 1. Lists notebooks on your reMarkable cloud via [`rmapi`](https://github.com/ddvk/rmapi)
-2. Downloads and renders handwritten pages (parses `.rm` v6 stroke files to SVG, converts to PNG)
+2. Downloads and renders handwritten pages (parses `.rm` v5/v6 stroke files to SVG, converts to PNG)
 3. Sends each page to Claude for handwriting transcription
-4. Writes the transcription as a markdown note with YAML frontmatter to your Obsidian vault
-5. Embeds the original handwritten page images alongside the transcription
-6. Tracks state per-page so subsequent syncs only re-transcribe changed pages
+4. Converts handwritten diagrams to **Mermaid** (flowcharts, sequences) or **Excalidraw** (freeform drawings)
+5. Writes the transcription as a markdown note with YAML frontmatter, preserving your reMarkable folder structure
+6. Embeds the original handwritten page images alongside the transcription
+7. Tracks state per-page so subsequent syncs only re-transcribe changed pages
 
 ## Prerequisites
 
@@ -129,15 +130,24 @@ uv run python remarkable_to_obsidian.py --merge-states /tmp/state_*.json
 
 ## Output
 
-Notes are written to `<vault>/Remarkable Notes/<notebook name>.md` with:
+Notes preserve your reMarkable folder hierarchy under `<vault>/Remarkable Notes/`. For example, `/1. Projects/Planning/Note` becomes `Remarkable Notes/1. Projects/Planning/Note.md`.
 
-- YAML frontmatter (title, modification date, reMarkable ID, tags)
+Each note includes:
+
+- YAML frontmatter (title, modification date, reMarkable ID/path, tags)
 - Transcribed markdown content
 - Embedded handwritten source images at the bottom
 
 Source page images are saved to `<vault>/Attachments/reMarkable/`.
 
-Diagrams and sketches that can't be represented as text are cropped from the source images and embedded inline.
+### Diagram conversion
+
+Handwritten diagrams are automatically converted to editable formats:
+
+- **Mermaid** — flowcharts, sequence diagrams, state diagrams, architecture diagrams. Embedded inline as ```` ```mermaid ```` code blocks that Obsidian renders natively.
+- **Excalidraw** — freeform sketches, mind maps, arbitrary layouts. Saved as `.excalidraw.md` files compatible with the [Obsidian Excalidraw plugin](https://github.com/zsviczian/obsidian-excalidraw-plugin).
+
+The original cropped PNG is always kept as a fallback in `Attachments/reMarkable/`.
 
 ## Incremental sync
 
