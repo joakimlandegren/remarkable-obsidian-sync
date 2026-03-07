@@ -222,14 +222,14 @@ def _render_rm_to_svg(rm_path: Path) -> str:
     # Color enum mapping
     COLOR_MAP = {0: "black", 1: "#808080", 2: "white", 3: "#FFD700", 4: "#0000FF", 5: "#FF0000"}
 
-    # Shift coordinates: rm coords are centered on page (x=0 is center)
-    cx, cy = RM_WIDTH / 2, RM_HEIGHT / 2
-
     # Detect format version
     if data.startswith(b'reMarkable .lines file, version=5'):
         parsed_strokes = _parse_rm_v5(data)
+        # v5 coordinates are absolute (0-based, top-left origin)
+        cx, cy = 0, 0
     else:
-        # v6 format via rmscene
+        # v6 format via rmscene — coordinates are centered (x=0 is page center)
+        cx, cy = RM_WIDTH / 2, RM_HEIGHT / 2
         blocks = list(read_blocks(io.BytesIO(data)))
         line_blocks = [b for b in blocks if isinstance(b, SceneLineItemBlock)]
         parsed_strokes = []
