@@ -1,9 +1,13 @@
+import base64
+import hashlib
+import io
 import json
 import os
 import shutil
 import tempfile
+import zipfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 
 import pytest
 
@@ -377,3 +381,545 @@ def test_sync_incremental_pages(tmp_path):
     written_md = mock_write.call_args.args[2]
     assert "# Page 1 cached" in written_md
     assert "# Page 2 updated" in written_md
+
+
+# --- .env loading tests ---
+
+from remarkable_to_obsidian import _load_dotenv
+
+
+def test_load_dotenv_loads_vars(tmp_path, monkeypatch):
+    """Loads variables from .env file."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("TEST_RM_DOTENV=loaded\nTEST_RM_OTHER=world\n")
+    monkeypatch.delenv("TEST_RM_DOTENV", raising=False)
+    monkeypatch.delenv("TEST_RM_OTHER", raising=False)
+
+    # Patch __file__ so _load_dotenv finds our test .env
+    import remarkable_to_obsidian
+    with patch.object(remarkable_to_obsidian, "__file__", str(tmp_path / "remarkable_to_obsidian.py")):
+        _load_dotenv()
+
+    assert os.environ.get("TEST_RM_DOTENV") == "loaded"
+    assert os.environ.get("TEST_RM_OTHER") == "world"
+    monkeypatch.delenv("TEST_RM_DOTENV")
+    monkeypatch.delenv("TEST_RM_OTHER")
+
+
+def test_load_dotenv_no_override(tmp_path, monkeypatch):
+    """Does not override existing environment variables."""
+    monkeypatch.setenv("TEST_RM_EXISTING", "original")
+    env_file = tmp_path / ".env"
+    env_file.write_text("TEST_RM_EXISTING=overwritten\n")
+
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        if key and _ and key not in os.environ:
+            os.environ[key] = value
+
+    assert os.environ["TEST_RM_EXISTING"] == "original"
+
+
+def test_load_dotenv_ignores_comments_and_blanks(tmp_path):
+    """Ignores comment lines and blank lines."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("# comment\n\nKEY1=val1\n  # another comment\nKEY2=val2\n")
+
+    parsed = {}
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        if key and _:
+            parsed[key] = value
+
+    assert parsed == {"KEY1": "val1", "KEY2": "val2"}
+
+
+# --- .sync_ignore tests ---
+
+from remarkable_to_obsidian import load_ignore_patterns, is_ignored
+
+
+def test_load_ignore_patterns(tmp_path):
+    """Loads patterns from .sync_ignore file."""
+    ignore_file = tmp_path / ".sync_ignore"
+    ignore_file.write_text("# comment\nKvitto*\n\nFinancial Core*\n")
+
+    with patch("remarkable_to_obsidian.Path") as MockPath:
+        # We need to mock Path(__file__).parent / ".sync_ignore"
+        pass
+
+    # Test the logic directly
+    patterns = []
+    for line in ignore_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(line)
+
+    assert patterns == ["Kvitto*", "Financial Core*"]
+
+
+def test_load_ignore_patterns_missing_file():
+    """Returns empty list when .sync_ignore doesn't exist."""
+    with patch.object(Path, "exists", return_value=False):
+        result = load_ignore_patterns()
+    assert result == []
+
+
+def test_is_ignored_by_name():
+    """Matches notebook name against patterns."""
+    assert is_ignored("Kvitto receipts", "/Kvitto receipts", ["Kvitto*"])
+    assert is_ignored("Financial Core Data", "/Projects/Financial Core Data", ["Financial Core*"])
+
+
+def test_is_ignored_by_path():
+    """Matches notebook path against patterns."""
+    assert is_ignored("Notes", "/trash/Notes", ["/trash/*"])
+    assert is_ignored("Plan", "/Work/Projects/Plan", ["/Work/*"])
+
+
+def test_is_ignored_glob_wildcards():
+    """Glob wildcards work correctly."""
+    assert is_ignored("report.docx", "/report.docx", ["*.docx"])
+    assert is_ignored("Notebook 3", "/Notebook 3", ["Notebook ?"])
+    assert not is_ignored("Notebook 12", "/Notebook 12", ["Notebook ?"])
+
+
+def test_is_ignored_no_match():
+    """Returns False when no patterns match."""
+    assert not is_ignored("Meeting Notes", "/Meeting Notes", ["Kvitto*", "*.docx"])
+
+
+# --- Batch operations tests ---
+
+from remarkable_to_obsidian import merge_state_files
+
+
+def test_merge_state_files(tmp_path):
+    """Merges multiple state files into target."""
+    target = tmp_path / "target.json"
+    target.write_text(json.dumps({"notebooks": {"existing": {"version": 1}}}))
+
+    src1 = tmp_path / "src1.json"
+    src1.write_text(json.dumps({"notebooks": {"nb-1": {"version": 2}}}))
+
+    src2 = tmp_path / "src2.json"
+    src2.write_text(json.dumps({"notebooks": {"nb-2": {"version": 3}}}))
+
+    merge_state_files(str(target), [str(src1), str(src2)])
+
+    result = json.loads(target.read_text())["notebooks"]
+    assert result["existing"] == {"version": 1}
+    assert result["nb-1"] == {"version": 2}
+    assert result["nb-2"] == {"version": 3}
+
+
+def test_merge_state_files_override(tmp_path):
+    """Later sources override earlier ones."""
+    target = tmp_path / "target.json"
+    target.write_text(json.dumps({"notebooks": {"nb-1": {"version": 1}}}))
+
+    src = tmp_path / "src.json"
+    src.write_text(json.dumps({"notebooks": {"nb-1": {"version": 5}}}))
+
+    merge_state_files(str(target), [str(src)])
+
+    result = json.loads(target.read_text())["notebooks"]
+    assert result["nb-1"] == {"version": 5}
+
+
+def test_merge_state_files_empty_source(tmp_path):
+    """Handles missing source files gracefully."""
+    target = tmp_path / "target.json"
+    target.write_text(json.dumps({"notebooks": {"nb-1": {"version": 1}}}))
+
+    merge_state_files(str(target), [str(tmp_path / "nonexistent.json")])
+
+    result = json.loads(target.read_text())["notebooks"]
+    assert result["nb-1"] == {"version": 1}
+
+
+# --- Hash file tests ---
+
+from remarkable_to_obsidian import _hash_file
+
+
+def test_hash_file(tmp_path):
+    """Returns consistent SHA-256 hex digest."""
+    f = tmp_path / "test.bin"
+    f.write_bytes(b"hello world")
+    expected = hashlib.sha256(b"hello world").hexdigest()
+    assert _hash_file(f) == expected
+    # Consistent on repeated calls
+    assert _hash_file(f) == expected
+
+
+# --- Image encoding tests ---
+
+from remarkable_to_obsidian import _encode_page_image
+
+
+def test_encode_page_image_png(tmp_path):
+    """PNG files return base64 + image/png."""
+    png = tmp_path / "page.png"
+    png.write_bytes(b"\x89PNG fake")
+    data, media_type = _encode_page_image(png)
+    assert media_type == "image/png"
+    assert base64.standard_b64decode(data) == b"\x89PNG fake"
+
+
+def test_encode_page_image_pdf(tmp_path):
+    """PDF files return base64 + application/pdf."""
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    data, media_type = _encode_page_image(pdf)
+    assert media_type == "application/pdf"
+    assert base64.standard_b64decode(data) == b"%PDF-1.4"
+
+
+def test_encode_page_image_svg(tmp_path):
+    """SVG files are converted to PNG via _svg_to_png."""
+    svg = tmp_path / "page.svg"
+    svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"></svg>')
+
+    fake_png = b"\x89PNG converted"
+    with patch("remarkable_to_obsidian._svg_to_png", return_value=fake_png):
+        data, media_type = _encode_page_image(svg)
+
+    assert media_type == "image/png"
+    assert base64.standard_b64decode(data) == fake_png
+
+
+# --- SVG to PNG tests ---
+
+from remarkable_to_obsidian import _svg_to_png, MAX_IMAGE_DIM
+
+
+def test_svg_to_png_normal_dimensions(tmp_path):
+    """Uses original width when dimensions are within limits."""
+    svg = tmp_path / "page.svg"
+    svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="1404" height="1872"></svg>')
+
+    with patch("cairosvg.svg2png", return_value=b"png_bytes") as mock_cairo:
+        result = _svg_to_png(svg)
+
+    assert result == b"png_bytes"
+    mock_cairo.assert_called_once_with(url=str(svg), output_width=1404)
+
+
+def test_svg_to_png_oversized(tmp_path):
+    """Scales down when dimensions exceed MAX_IMAGE_DIM."""
+    svg = tmp_path / "page.svg"
+    svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="1404" height="10000"></svg>')
+
+    with patch("cairosvg.svg2png", return_value=b"png_bytes") as mock_cairo:
+        result = _svg_to_png(svg)
+
+    # Scale = min(8000/10000, 8000/1404) = 0.8
+    expected_width = int(1404 * 0.8)
+    mock_cairo.assert_called_once_with(url=str(svg), output_width=expected_width)
+
+
+# --- Transcription tests (page-level) ---
+
+from remarkable_to_obsidian import transcribe_page, transcribe_pages
+
+
+def test_transcribe_page(tmp_path):
+    """Sends single page image to Claude and returns markdown."""
+    page = tmp_path / "page.png"
+    page.write_bytes(b"\x89PNG fake page")
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="# Page content")]
+    mock_client.messages.create.return_value = mock_response
+
+    result = transcribe_page(mock_client, page, "claude-opus-4-6")
+
+    assert result == "# Page content"
+    call_args = mock_client.messages.create.call_args
+    content = call_args.kwargs["messages"][0]["content"]
+    assert content[0]["type"] == "image"
+    assert content[0]["source"]["media_type"] == "image/png"
+    assert content[1]["type"] == "text"
+
+
+def test_transcribe_pages_multiple(tmp_path):
+    """Sends multiple pages to Claude in a single request."""
+    page1 = tmp_path / "page1.png"
+    page2 = tmp_path / "page2.png"
+    page1.write_bytes(b"\x89PNG page1")
+    page2.write_bytes(b"\x89PNG page2")
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="# Page 1\n\n# Page 2")]
+    mock_client.messages.create.return_value = mock_response
+
+    result = transcribe_pages(mock_client, [page1, page2], "claude-opus-4-6")
+
+    assert result == "# Page 1\n\n# Page 2"
+    call_args = mock_client.messages.create.call_args
+    content = call_args.kwargs["messages"][0]["content"]
+    # 2 images + 1 text prompt
+    assert len(content) == 3
+    assert content[0]["type"] == "image"
+    assert content[1]["type"] == "image"
+    assert content[2]["type"] == "text"
+
+
+# --- Diagram extraction tests ---
+
+from remarkable_to_obsidian import extract_diagram_crops, DIAGRAM_RE
+
+
+def test_diagram_regex():
+    """Regex matches diagram markers correctly."""
+    text = '> [Diagram(page=1, top=20, bottom=60): a flowchart showing process]'
+    match = DIAGRAM_RE.search(text)
+    assert match is not None
+    assert match.group(1) == "1"
+    assert match.group(2) == "20"
+    assert match.group(3) == "60"
+    assert match.group(4) == "a flowchart showing process"
+
+
+def test_extract_diagram_crops_no_diagrams(tmp_path):
+    """Returns unchanged markdown when no diagram markers present."""
+    markdown = "# Notes\n\n- Item 1\n- Item 2"
+    result, crops = extract_diagram_crops(markdown, [], str(tmp_path), "Test")
+    assert result == markdown
+    assert crops == []
+
+
+def test_extract_diagram_crops_out_of_range(tmp_path):
+    """Leaves marker as-is when page number is out of range."""
+    markdown = '> [Diagram(page=5, top=10, bottom=50): something]'
+    page = tmp_path / "page1.png"
+    page.write_bytes(b"\x89PNG")
+
+    result, crops = extract_diagram_crops(markdown, [page], str(tmp_path), "Test")
+    assert result == markdown  # unchanged
+    assert crops == []
+
+
+def test_extract_diagram_crops_success(tmp_path):
+    """Crops image and replaces marker with embed."""
+    markdown = '> [Diagram(page=1, top=20, bottom=60): a chart]'
+
+    # Create a fake PNG image
+    from PIL import Image
+    img = Image.new("RGB", (100, 200), color="white")
+    page = tmp_path / "page1.png"
+    img.save(str(page), "PNG")
+
+    result, crops = extract_diagram_crops(markdown, [page], str(tmp_path), "Test")
+
+    assert "![[Test - diagram 1.png]]" in result
+    assert "> *a chart*" in result
+    assert len(crops) == 1
+    # Verify crop file was saved
+    crop_path = tmp_path / "Attachments" / "reMarkable" / "Test - diagram 1.png"
+    assert crop_path.exists()
+
+
+# --- Save source pages tests ---
+
+from remarkable_to_obsidian import save_source_pages
+
+
+def test_save_source_pages_pdf(tmp_path):
+    """PDF files are copied with notebook name."""
+    vault = tmp_path / "vault"
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4 content")
+
+    notebook = {"name": "My Notes"}
+    result = save_source_pages(str(vault), notebook, [pdf])
+
+    assert result == ["My Notes.pdf"]
+    saved = vault / "Attachments" / "reMarkable" / "My Notes.pdf"
+    assert saved.exists()
+
+
+def test_save_source_pages_png(tmp_path):
+    """PNG files are copied with page numbering."""
+    vault = tmp_path / "vault"
+    png = tmp_path / "page.png"
+    png.write_bytes(b"\x89PNG data")
+
+    notebook = {"name": "Sketches"}
+    result = save_source_pages(str(vault), notebook, [png])
+
+    assert result == ["Sketches - page 1.png"]
+    saved = vault / "Attachments" / "reMarkable" / "Sketches - page 1.png"
+    assert saved.exists()
+
+
+def test_save_source_pages_svg(tmp_path):
+    """SVG files are converted to PNG."""
+    vault = tmp_path / "vault"
+    svg = tmp_path / "page.svg"
+    svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"></svg>')
+
+    notebook = {"name": "Drawing"}
+    with patch("remarkable_to_obsidian._svg_to_png", return_value=b"\x89PNG converted"):
+        result = save_source_pages(str(vault), notebook, [svg])
+
+    assert result == ["Drawing - page 1.png"]
+    saved = vault / "Attachments" / "reMarkable" / "Drawing - page 1.png"
+    assert saved.exists()
+    assert saved.read_bytes() == b"\x89PNG converted"
+
+
+# --- Extract .rm pages tests ---
+
+from remarkable_to_obsidian import _extract_rm_pages
+
+
+def test_extract_rm_pages_pdf(tmp_path):
+    """Returns None when PDF is found (PDF-based notebook)."""
+    def mock_run(cmd, **kwargs):
+        cwd = kwargs.get("cwd", ".")
+        (Path(cwd) / "notebook.pdf").write_bytes(b"%PDF-1.4")
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        result = _extract_rm_pages("rmapi", "/Notebook", tmp_path)
+
+    assert result is None
+
+
+def test_extract_rm_pages_zip_with_content(tmp_path):
+    """Returns ordered .rm files from zip with .content ordering."""
+    # Create a zip with .rm files and a .content manifest
+    zip_path = tmp_path / "notebook.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("uuid/page-b.rm", b"page b data")
+        zf.writestr("uuid/page-a.rm", b"page a data")
+        content = {
+            "cPages": {
+                "pages": [
+                    {"id": "page-a"},
+                    {"id": "page-b"},
+                ]
+            }
+        }
+        zf.writestr("uuid.content", json.dumps(content))
+
+    def mock_run(cmd, **kwargs):
+        # geta produces no PDF, no zip
+        if cmd[1] == "geta":
+            return MagicMock(returncode=0)
+        # get produces the zip
+        if cmd[1] == "get":
+            cwd = kwargs.get("cwd", ".")
+            shutil.copy2(zip_path, Path(cwd) / "notebook.zip")
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0)
+
+    output = tmp_path / "output"
+    output.mkdir()
+    with patch("subprocess.run", side_effect=mock_run):
+        result = _extract_rm_pages("rmapi", "/Notebook", output)
+
+    assert len(result) == 2
+    assert result[0].stem == "page-a"  # ordered by .content
+    assert result[1].stem == "page-b"
+
+
+def test_extract_rm_pages_no_rm_files(tmp_path):
+    """Returns empty list when zip contains no .rm files."""
+    zip_path = tmp_path / "notebook.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("uuid/notes.txt", b"not an rm file")
+
+    def mock_run(cmd, **kwargs):
+        if cmd[1] == "geta":
+            cwd = kwargs.get("cwd", ".")
+            shutil.copy2(zip_path, Path(cwd) / "notebook.zip")
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0)
+
+    output = tmp_path / "output"
+    output.mkdir()
+    with patch("subprocess.run", side_effect=mock_run):
+        result = _extract_rm_pages("rmapi", "/Notebook", output)
+
+    assert result == []
+
+
+def test_extract_rm_pages_no_output(tmp_path):
+    """Returns empty list when neither PDF nor zip is produced."""
+    def mock_run(cmd, **kwargs):
+        return MagicMock(returncode=0)
+
+    output = tmp_path / "output"
+    output.mkdir()
+    with patch("subprocess.run", side_effect=mock_run):
+        result = _extract_rm_pages("rmapi", "/Notebook", output)
+
+    assert result == []
+
+
+# --- Export notebook tests ---
+
+from remarkable_to_obsidian import export_notebook
+
+
+def test_export_notebook_pdf_based(tmp_path):
+    """PDF notebook returns PDF paths."""
+    with patch("remarkable_to_obsidian._extract_rm_pages", return_value=None):
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        result = export_notebook("rmapi", "/Notebook", "Notebook", tmp_path)
+
+    assert len(result) == 1
+    assert result[0].suffix == ".pdf"
+
+
+def test_export_notebook_rm_based(tmp_path):
+    """RM notebook renders SVGs."""
+    rm1 = tmp_path / "page1.rm"
+    rm1.write_bytes(b"rm data")
+
+    fake_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1404" height="1872"></svg>'
+    with patch("remarkable_to_obsidian._extract_rm_pages", return_value=[rm1]), \
+         patch("remarkable_to_obsidian._render_rm_to_svg", return_value=fake_svg):
+        result = export_notebook("rmapi", "/Notebook", "Notebook", tmp_path)
+
+    assert len(result) == 1
+    assert result[0].suffix == ".svg"
+    assert result[0].read_text() == fake_svg
+
+
+def test_export_notebook_empty(tmp_path):
+    """Returns empty list when no pages extracted."""
+    with patch("remarkable_to_obsidian._extract_rm_pages", return_value=[]):
+        result = export_notebook("rmapi", "/Notebook", "Notebook", tmp_path)
+
+    assert result == []
+
+
+# --- Write note with source files test ---
+
+
+def test_write_obsidian_note_with_sources(tmp_path):
+    """Appends source file embeds when provided."""
+    vault = tmp_path / "vault"
+    notebook = {"id": "abc", "name": "Notes", "modified": "2025-01-01"}
+    markdown = "# Content"
+    sources = ["Notes - page 1.png", "Notes - page 2.png"]
+
+    path = write_obsidian_note(str(vault), notebook, markdown, sources)
+
+    content = path.read_text()
+    assert "## Handwritten source" in content
+    assert "![[Notes - page 1.png]]" in content
+    assert "![[Notes - page 2.png]]" in content

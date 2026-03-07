@@ -45,7 +45,23 @@ uv sync
 
 ## Configuration
 
-All configuration is via environment variables:
+Create a `.env` file in the project root (gitignored). The script loads it automatically without overriding existing env vars:
+
+```bash
+# .env
+RMAPI_BIN=/path/to/rmapi
+OBSIDIAN_VAULT=/path/to/your/obsidian/vault
+
+# For Vertex AI (preferred)
+CLAUDE_CODE_USE_VERTEX=1
+ANTHROPIC_VERTEX_PROJECT_ID=your-gcp-project-id
+CLOUD_ML_REGION=europe-west1
+
+# Or for direct Anthropic API
+# ANTHROPIC_API_KEY=sk-ant-...
+```
+
+All configuration variables can also be set as environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
@@ -64,30 +80,51 @@ All configuration is via environment variables:
 ### Dry run (preview without writing)
 
 ```bash
-OBSIDIAN_VAULT=~/my-vault uv run python remarkable_to_obsidian.py --dry-run
+uv run python remarkable_to_obsidian.py --dry-run
 ```
 
 ### Full sync
 
 ```bash
-# Using Anthropic API directly
-ANTHROPIC_API_KEY=sk-ant-... \
-OBSIDIAN_VAULT=~/my-vault \
-uv run python remarkable_to_obsidian.py
-
-# Using Vertex AI
-CLAUDE_CODE_USE_VERTEX=1 \
-ANTHROPIC_VERTEX_PROJECT_ID=my-project \
-OBSIDIAN_VAULT=~/my-vault \
 uv run python remarkable_to_obsidian.py
 ```
 
 ### Sync a specific folder
 
 ```bash
-RM_WATCH_PATH="/Work/Meeting Notes" \
-OBSIDIAN_VAULT=~/my-vault \
-uv run python remarkable_to_obsidian.py
+RM_WATCH_PATH="/Work/Meeting Notes" uv run python remarkable_to_obsidian.py
+```
+
+### Excluding notebooks
+
+Create a `.sync_ignore` file in the project root to skip specific notebooks. One pattern per line, supports glob wildcards:
+
+```
+Kvitto*
+Financial Core*
+*.docx
+/trash/*
+```
+
+Patterns match against both the notebook name and its full reMarkable path.
+
+### Parallel batch sync
+
+For large libraries, split work across parallel processes:
+
+```bash
+# 1. List notebooks to JSON (avoids repeated rmapi queries)
+uv run python remarkable_to_obsidian.py --list-only /tmp/notebooks.json
+
+# 2. Run batches in parallel (each with its own state file)
+RM_STATE_FILE=/tmp/state_0.json uv run python remarkable_to_obsidian.py \
+  --notebooks-json /tmp/notebooks.json --slice 0:28 &
+RM_STATE_FILE=/tmp/state_1.json uv run python remarkable_to_obsidian.py \
+  --notebooks-json /tmp/notebooks.json --slice 28:56 &
+# ... etc
+
+# 3. Merge batch states into main state
+uv run python remarkable_to_obsidian.py --merge-states /tmp/state_*.json
 ```
 
 ## Output

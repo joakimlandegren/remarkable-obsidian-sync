@@ -1,0 +1,9 @@
+# Notebooks to skip during sync.
+# One pattern per line. Supports glob wildcards (* and ?).
+# Matches against both notebook name and full path.
+#
+# Examples:
+#   Kvitto*             # skip notebooks starting with "Kvitto"
+#   /trash/*            # skip everything in trash
+#   Financial Core*     # skip specific notebook
+#   *.docx              # skip all docx imports

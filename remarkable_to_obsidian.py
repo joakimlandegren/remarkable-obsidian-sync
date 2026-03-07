@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import fnmatch
 import tempfile
 import zipfile
 from datetime import datetime
@@ -18,7 +19,45 @@ from pathlib import Path
 
 from rmscene import read_blocks, SceneLineItemBlock
 
+
+def _load_dotenv():
+    """Load .env.local from the script's directory (does not override existing env vars)."""
+    env_file = Path(__file__).parent / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        if key and _ and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
+
 log = logging.getLogger(__name__)
+
+
+def load_ignore_patterns() -> list[str]:
+    """Load glob patterns from .sync_ignore file. One pattern per line, # for comments."""
+    ignore_file = Path(__file__).parent / ".sync_ignore"
+    if not ignore_file.exists():
+        return []
+    patterns = []
+    for line in ignore_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(line)
+    return patterns
+
+
+def is_ignored(notebook_name: str, notebook_path: str, patterns: list[str]) -> bool:
+    """Check if a notebook matches any ignore pattern (matched against name and path)."""
+    for pattern in patterns:
+        if fnmatch.fnmatch(notebook_name, pattern) or fnmatch.fnmatch(notebook_path, pattern):
+            return True
+    return False
 
 # reMarkable page dimensions
 RM_WIDTH = 1404
@@ -693,9 +732,23 @@ def sync_notebooks(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def merge_state_files(target_file: str, source_files: list[str]) -> None:
+    """Merge multiple state files into the target, combining notebook entries."""
+    merged = load_state(target_file)
+    for src in source_files:
+        src_state = load_state(src)
+        merged.update(src_state)
+    save_state(target_file, merged)
+    log.info("Merged %d state files into %s (%d notebooks)", len(source_files), target_file, len(merged))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync reMarkable notebooks to Obsidian")
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing files")
+    parser.add_argument("--list-only", metavar="FILE", help="List notebooks to JSON file and exit")
+    parser.add_argument("--notebooks-json", metavar="FILE", help="Read notebook list from JSON instead of rmapi")
+    parser.add_argument("--slice", metavar="START:END", help="Process only notebooks[START:END]")
+    parser.add_argument("--merge-states", nargs="+", metavar="FILE", help="Merge state files into main state and exit")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -704,11 +757,45 @@ def main():
     )
 
     config = load_config()
+
+    # Merge mode: combine batch state files and exit
+    if args.merge_states:
+        merge_state_files(config["state_file"], args.merge_states)
+        return
+
     state = load_state(config["state_file"])
 
-    log.info("Starting reMarkable sync (watch: %s)", config["watch_path"])
-    notebooks = list_notebooks(config["rmapi_bin"], config["watch_path"])
-    log.info("Found %d notebooks", len(notebooks))
+    # Get notebook list
+    if args.notebooks_json:
+        notebooks = json.loads(Path(args.notebooks_json).read_text())
+        log.info("Loaded %d notebooks from %s", len(notebooks), args.notebooks_json)
+    else:
+        log.info("Starting reMarkable sync (watch: %s)", config["watch_path"])
+        notebooks = list_notebooks(config["rmapi_bin"], config["watch_path"])
+        log.info("Found %d notebooks", len(notebooks))
+
+    # List-only mode: save and exit
+    if args.list_only:
+        Path(args.list_only).write_text(json.dumps(notebooks, indent=2))
+        log.info("Saved notebook list to %s", args.list_only)
+        return
+
+    # Filter ignored notebooks
+    ignore_patterns = load_ignore_patterns()
+    if ignore_patterns:
+        before = len(notebooks)
+        notebooks = [nb for nb in notebooks if not is_ignored(nb["name"], nb["path"], ignore_patterns)]
+        skipped = before - len(notebooks)
+        if skipped:
+            log.info("Skipped %d notebooks matching .sync_ignore patterns", skipped)
+
+    # Apply slice
+    if args.slice:
+        start, end = args.slice.split(":")
+        start = int(start) if start else 0
+        end = int(end) if end else len(notebooks)
+        notebooks = notebooks[start:end]
+        log.info("Processing slice [%d:%d] (%d notebooks)", start, end, len(notebooks))
 
     client = None
     if not args.dry_run:
