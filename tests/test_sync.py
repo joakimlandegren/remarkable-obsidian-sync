@@ -197,3 +197,39 @@ def test_transcribe_pdf(tmp_path):
     content = messages[0]["content"]
     assert content[0]["type"] == "document"
     assert content[0]["source"]["media_type"] == "application/pdf"
+
+
+# --- Obsidian writer tests ---
+
+from remarkable_to_obsidian import sanitize_filename, write_obsidian_note
+
+
+def test_sanitize_filename():
+    """Sanitizes notebook names for filesystem use."""
+    assert sanitize_filename("Meeting Notes") == "Meeting Notes"
+    assert sanitize_filename("Notes/2025") == "Notes_2025"
+    assert sanitize_filename("hello@world!") == "hello_world_"
+
+
+def test_write_obsidian_note(tmp_path):
+    """Writes a markdown note with YAML frontmatter."""
+    vault = tmp_path / "vault"
+    notebook = {
+        "id": "abc-123",
+        "name": "Meeting Notes",
+        "modified": "2025-01-15T10:30:00Z",
+    }
+    markdown = "# Meeting Notes\n\n- Discussed roadmap"
+
+    path = write_obsidian_note(str(vault), notebook, markdown)
+
+    assert path.exists()
+    content = path.read_text()
+    assert content.startswith("---\n")
+    assert 'title: "Meeting Notes"' in content
+    assert 'remarkable_id: "abc-123"' in content
+    assert "source: reMarkable" in content
+    assert "- handwritten" in content
+    assert "- inbox" in content
+    assert content.endswith("- Discussed roadmap\n")
+    assert "Inbox/reMarkable" in str(path.parent)

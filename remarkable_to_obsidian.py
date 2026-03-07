@@ -4,8 +4,10 @@ import base64
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -131,3 +133,35 @@ def transcribe_pdf(client, pdf_path: Path, model: str) -> str:
         ],
     )
     return message.content[0].text
+
+
+def sanitize_filename(name: str) -> str:
+    """Keep alphanumeric, spaces, hyphens, underscores; replace others with _."""
+    return re.sub(r"[^a-zA-Z0-9 _-]", "_", name)
+
+
+def write_obsidian_note(vault_path: str, notebook: dict, markdown: str) -> Path:
+    """Write a markdown note with YAML frontmatter to the Obsidian vault inbox."""
+    inbox = Path(vault_path) / "Inbox" / "reMarkable"
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    modified = datetime.fromisoformat(notebook["modified"].replace("Z", "+00:00"))
+    timestamp = modified.strftime("%Y-%m-%d %H%M")
+    safe_name = sanitize_filename(notebook["name"])
+    filename = f"{timestamp} {safe_name}.md"
+
+    frontmatter = (
+        f'---\n'
+        f'title: "{notebook["name"]}"\n'
+        f'created: {notebook["modified"]}\n'
+        f'source: reMarkable\n'
+        f'remarkable_id: "{notebook["id"]}"\n'
+        f'tags:\n'
+        f'  - handwritten\n'
+        f'  - inbox\n'
+        f'---\n'
+    )
+
+    note_path = inbox / filename
+    note_path.write_text(frontmatter + "\n" + markdown + "\n")
+    return note_path
