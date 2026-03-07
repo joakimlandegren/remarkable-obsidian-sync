@@ -1,3 +1,4 @@
+import json
 import os
 import pytest
 
@@ -34,3 +35,38 @@ def test_config_from_env(monkeypatch):
     assert config["state_file"] == "/tmp/state.json"
     assert config["watch_path"] == "/Notes"
     assert config["model"] == "claude-sonnet-4-20250514"
+
+
+# --- State management tests ---
+
+from remarkable_to_obsidian import load_state, save_state
+
+
+def test_load_state_missing_file(tmp_path):
+    """Returns empty dict when state file doesn't exist."""
+    state = load_state(str(tmp_path / "nonexistent.json"))
+    assert state == {}
+
+
+def test_load_state_existing_file(tmp_path):
+    """Loads state from existing JSON file."""
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"notebooks": {"abc-123": 5}}))
+    state = load_state(str(state_file))
+    assert state == {"abc-123": 5}
+
+
+def test_save_state(tmp_path):
+    """Saves state to JSON file, creating parent dirs."""
+    state_file = tmp_path / "sub" / "state.json"
+    save_state(str(state_file), {"abc-123": 5})
+    data = json.loads(state_file.read_text())
+    assert data == {"notebooks": {"abc-123": 5}}
+
+
+def test_load_state_corrupt_file(tmp_path):
+    """Returns empty dict when state file is corrupt."""
+    state_file = tmp_path / "state.json"
+    state_file.write_text("not json{{{")
+    state = load_state(str(state_file))
+    assert state == {}
