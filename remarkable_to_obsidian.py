@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import fnmatch
@@ -176,11 +177,47 @@ def _walk_directory(rmapi_bin: str, path: str, notebooks: list[dict]) -> None:
             _walk_directory(rmapi_bin, full_path, notebooks)
 
 
+def _parse_rm_v5(data: bytes) -> list[dict]:
+    """Parse a .rm v5 binary file and return a list of stroke dicts."""
+    V5_HEADER = b'reMarkable .lines file, version=5'
+    offset = len(V5_HEADER) + 10  # header + padding
+
+    COLOR_MAP = {0: "black", 1: "#808080", 2: "white", 3: "#FFD700", 4: "#0000FF", 5: "#FF0000"}
+    strokes = []
+
+    num_layers = struct.unpack_from('<I', data, offset)[0]
+    offset += 4
+
+    for _ in range(num_layers):
+        num_lines = struct.unpack_from('<I', data, offset)[0]
+        offset += 4
+
+        for _ in range(num_lines):
+            brush_type, color, _unknown, brush_size = struct.unpack_from('<IIIf', data, offset)
+            offset += 16
+            _unknown2 = struct.unpack_from('<I', data, offset)[0]  # v5-specific field
+            offset += 4
+            num_points = struct.unpack_from('<I', data, offset)[0]
+            offset += 4
+
+            points = []
+            for _ in range(num_points):
+                x, y, speed, direction, width, pressure = struct.unpack_from('<ffffff', data, offset)
+                offset += 24
+                points.append({"x": x, "y": y, "width": width, "pressure": pressure})
+
+            strokes.append({
+                "color": COLOR_MAP.get(color, "black"),
+                "width": max(1.0, brush_size * 2.0),
+                "points": points,
+            })
+
+    return strokes
+
+
 def _render_rm_to_svg(rm_path: Path) -> str:
-    """Parse a .rm v6 file using rmscene and render strokes to SVG string."""
+    """Parse a .rm file (v5 or v6) and render strokes to SVG string."""
     data = rm_path.read_bytes()
-    blocks = list(read_blocks(io.BytesIO(data)))
-    line_blocks = [b for b in blocks if isinstance(b, SceneLineItemBlock)]
 
     # Color enum mapping
     COLOR_MAP = {0: "black", 1: "#808080", 2: "white", 3: "#FFD700", 4: "#0000FF", 5: "#FF0000"}
@@ -188,33 +225,47 @@ def _render_rm_to_svg(rm_path: Path) -> str:
     # Shift coordinates: rm coords are centered on page (x=0 is center)
     cx, cy = RM_WIDTH / 2, RM_HEIGHT / 2
 
-    # First pass: compute actual content bounds for scrollable pages
+    # Detect format version
+    if data.startswith(b'reMarkable .lines file, version=5'):
+        parsed_strokes = _parse_rm_v5(data)
+    else:
+        # v6 format via rmscene
+        blocks = list(read_blocks(io.BytesIO(data)))
+        line_blocks = [b for b in blocks if isinstance(b, SceneLineItemBlock)]
+        parsed_strokes = []
+        for lb in line_blocks:
+            item = lb.item
+            if item is None or item.value is None:
+                continue
+            line = item.value
+            if not line.points or len(line.points) < 2:
+                continue
+            color_val = line.color.value if hasattr(line.color, 'value') else 0
+            parsed_strokes.append({
+                "color": COLOR_MAP.get(color_val, "black"),
+                "width": max(1.0, line.thickness_scale * 2.0),
+                "points": [{"x": pt.x, "y": pt.y} for pt in line.points],
+            })
+
+    # Render strokes to SVG
     min_y, max_y = float('inf'), float('-inf')
     strokes_svg = []
-    for lb in line_blocks:
-        item = lb.item
-        if item is None or item.value is None:
-            continue
-        line = item.value
-        points = line.points
-        if not points or len(points) < 2:
+    for stroke in parsed_strokes:
+        points = stroke["points"]
+        if len(points) < 2:
             continue
 
-        color_val = line.color.value if hasattr(line.color, 'value') else 0
-        stroke_color = COLOR_MAP.get(color_val, "black")
-        stroke_width = max(1.0, line.thickness_scale * 2.0)
-
-        path_data = f"M {points[0].x + cx:.1f} {points[0].y + cy:.1f}"
+        path_data = f"M {points[0]['x'] + cx:.1f} {points[0]['y'] + cy:.1f}"
         for pt in points[1:]:
-            path_data += f" L {pt.x + cx:.1f} {pt.y + cy:.1f}"
+            path_data += f" L {pt['x'] + cx:.1f} {pt['y'] + cy:.1f}"
 
         for pt in points:
-            min_y = min(min_y, pt.y + cy)
-            max_y = max(max_y, pt.y + cy)
+            min_y = min(min_y, pt['y'] + cy)
+            max_y = max(max_y, pt['y'] + cy)
 
         strokes_svg.append(
-            f'<path d="{path_data}" stroke="{stroke_color}" '
-            f'stroke-width="{stroke_width:.1f}" fill="none" '
+            f'<path d="{path_data}" stroke="{stroke["color"]}" '
+            f'stroke-width="{stroke["width"]:.1f}" fill="none" '
             f'stroke-linecap="round" stroke-linejoin="round"/>'
         )
 
@@ -573,7 +624,12 @@ def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path]) -
 
 def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_files: list[str] | None = None) -> Path:
     """Write a markdown note with YAML frontmatter to the Obsidian vault inbox."""
+    # Preserve reMarkable folder structure under Remarkable Notes/
+    rm_path = notebook.get("path", "")
+    parent_dir = str(Path(rm_path).parent).lstrip("/")
     inbox = Path(vault_path) / "Remarkable Notes"
+    if parent_dir and parent_dir != ".":
+        inbox = inbox / parent_dir
     inbox.mkdir(parents=True, exist_ok=True)
 
     safe_name = sanitize_filename(notebook["name"])
@@ -585,6 +641,7 @@ def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_f
         f'modified: {notebook["modified"]}\n'
         f'source: reMarkable\n'
         f'remarkable_id: "{notebook["id"]}"\n'
+        f'remarkable_path: "{rm_path}"\n'
         f'tags:\n'
         f'  - handwritten\n'
         f'  - inbox\n'
