@@ -5,5 +5,10 @@
 # Examples:
 #   Kvitto*             # skip notebooks starting with "Kvitto"
 #   /trash/*            # skip everything in trash
-#   Financial Core*     # skip specific notebook
 #   *.docx              # skip all docx imports
+
+# Imported PDFs without handwriting (no .rm files)
+System handover guidelines
+Jira Align - Subscriptions Mission*
+Financial Core Data Initiative
+Payouts
