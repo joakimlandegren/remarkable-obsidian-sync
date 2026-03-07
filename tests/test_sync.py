@@ -1,5 +1,7 @@
 import json
 import os
+from unittest.mock import patch, MagicMock
+
 import pytest
 
 
@@ -70,3 +72,63 @@ def test_load_state_corrupt_file(tmp_path):
     state_file.write_text("not json{{{")
     state = load_state(str(state_file))
     assert state == {}
+
+
+# --- rmapi listing tests ---
+
+from remarkable_to_obsidian import list_notebooks
+
+
+def _mock_rmapi_ls(responses: dict):
+    """Create a mock for subprocess.run that returns rmapi ls --json responses."""
+    def side_effect(cmd, **kwargs):
+        # Extract path from command: ["rmapi", "ls", "--json", path]
+        path = cmd[3] if len(cmd) > 3 else "/"
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = json.dumps(responses.get(path, []))
+        return result
+    return side_effect
+
+
+def test_list_notebooks_flat():
+    """Lists notebooks in a flat directory."""
+    responses = {
+        "/": [
+            {"id": "abc-123", "name": "Meeting Notes", "type": "DocumentType", "version": 3, "modifiedClient": "2025-01-15T10:30:00Z"},
+            {"id": "def-456", "name": "Sketches", "type": "DocumentType", "version": 1, "modifiedClient": "2025-01-10T08:00:00Z"},
+        ]
+    }
+    with patch("subprocess.run", side_effect=_mock_rmapi_ls(responses)):
+        notebooks = list_notebooks("rmapi", "/")
+
+    assert len(notebooks) == 2
+    assert notebooks[0]["id"] == "abc-123"
+    assert notebooks[0]["path"] == "/Meeting Notes"
+    assert notebooks[1]["path"] == "/Sketches"
+
+
+def test_list_notebooks_recursive():
+    """Recursively lists notebooks in nested directories."""
+    responses = {
+        "/": [
+            {"id": "dir-1", "name": "Work", "type": "CollectionType", "version": 1, "modifiedClient": "2025-01-01T00:00:00Z"},
+        ],
+        "/Work": [
+            {"id": "nb-1", "name": "Project Plan", "type": "DocumentType", "version": 2, "modifiedClient": "2025-01-20T14:00:00Z"},
+        ],
+    }
+    with patch("subprocess.run", side_effect=_mock_rmapi_ls(responses)):
+        notebooks = list_notebooks("rmapi", "/")
+
+    assert len(notebooks) == 1
+    assert notebooks[0]["id"] == "nb-1"
+    assert notebooks[0]["path"] == "/Work/Project Plan"
+
+
+def test_list_notebooks_auth_failure():
+    """Raises SystemExit when rmapi fails (auth issue)."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=1, stderr="auth error")
+        with pytest.raises(SystemExit):
+            list_notebooks("rmapi", "/")

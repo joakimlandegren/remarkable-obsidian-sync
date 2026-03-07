@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -38,3 +40,35 @@ def save_state(state_file: str, notebooks: dict) -> None:
     path = Path(state_file)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"notebooks": notebooks}, indent=2))
+
+
+def list_notebooks(rmapi_bin: str, watch_path: str) -> list[dict]:
+    """Recursively list all notebooks under watch_path using rmapi ls --json."""
+    notebooks = []
+    _walk_directory(rmapi_bin, watch_path, notebooks)
+    return notebooks
+
+
+def _walk_directory(rmapi_bin: str, path: str, notebooks: list[dict]) -> None:
+    """Recursively walk a reMarkable directory, collecting notebooks."""
+    result = subprocess.run(
+        [rmapi_bin, "ls", "--json", path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        log.error("rmapi ls failed (exit %d). Run `rmapi` to authenticate.", result.returncode)
+        sys.exit(1)
+
+    entries = json.loads(result.stdout)
+    for entry in entries:
+        full_path = f"{path.rstrip('/')}/{entry['name']}"
+        if entry["type"] == "DocumentType":
+            notebooks.append({
+                "id": entry["id"],
+                "name": entry["name"],
+                "version": entry["version"],
+                "modified": entry["modifiedClient"],
+                "path": full_path,
+            })
+        elif entry["type"] == "CollectionType":
+            _walk_directory(rmapi_bin, full_path, notebooks)
