@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Sync reMarkable handwritten notebooks to Obsidian via Claude vision"
 requires-python = ">=3.12"
 dependencies = [
-    "anthropic>=0.40.0",
+    "anthropic[vertex]>=0.40.0",
+    "cairosvg>=2.7.0",
+    "rmscene>=0.7.0",
 ]
 
 [dependency-groups]

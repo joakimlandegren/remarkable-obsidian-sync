@@ -2,6 +2,8 @@
 
 import argparse
 import base64
+import hashlib
+import io
 import json
 import logging
 import os
@@ -10,17 +12,27 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
+from rmscene import read_blocks, SceneLineItemBlock
+
 log = logging.getLogger(__name__)
+
+# reMarkable page dimensions
+RM_WIDTH = 1404
+RM_HEIGHT = 1872
 
 
 def load_config() -> dict:
     """Load configuration from environment variables with defaults."""
     home = Path.home()
     return {
-        "obsidian_vault": os.environ.get("OBSIDIAN_VAULT", str(home / "obsidian-vault")),
+        "obsidian_vault": os.environ.get(
+            "OBSIDIAN_VAULT",
+            str(home / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "joakimlandegren"),
+        ),
         "rmapi_bin": os.environ.get("RMAPI_BIN", "rmapi"),
         "state_file": os.environ.get("RM_STATE_FILE", str(home / ".remarkable_sync_state.json")),
         "watch_path": os.environ.get("RM_WATCH_PATH", "/"),
@@ -49,14 +61,62 @@ def save_state(state_file: str, notebooks: dict) -> None:
 
 
 def list_notebooks(rmapi_bin: str, watch_path: str) -> list[dict]:
-    """Recursively list all notebooks under watch_path using rmapi ls --json."""
+    """List all notebooks under watch_path using rmapi find + stat."""
+    # Always search from root so paths are absolute
+    result = subprocess.run(
+        [rmapi_bin, "find", "/", ".*"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        log.error("rmapi find failed (exit %d). Run `rmapi` to authenticate.", result.returncode)
+        sys.exit(1)
+
     notebooks = []
-    _walk_directory(rmapi_bin, watch_path, notebooks)
+    watch_norm = watch_path.rstrip("/")
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        if not line.startswith("[f]"):
+            continue
+        # Extract path: "[f] /path/to/notebook"
+        path = line[4:].strip()
+
+        # Skip trash
+        if path.startswith("/trash/"):
+            continue
+
+        # Filter by watch_path
+        if watch_norm != "" and watch_norm != "/":
+            if path != watch_norm and not path.startswith(watch_norm + "/"):
+                continue
+
+        # Get metadata via stat
+        stat_result = subprocess.run(
+            [rmapi_bin, "stat", path],
+            capture_output=True, text=True,
+        )
+        if stat_result.returncode != 0:
+            log.warning("Failed to stat %s, skipping", path)
+            continue
+
+        try:
+            meta = json.loads(stat_result.stdout)
+        except json.JSONDecodeError:
+            log.warning("Failed to parse stat output for %s, skipping", path)
+            continue
+
+        notebooks.append({
+            "id": meta["ID"],
+            "name": meta["Name"],
+            "version": meta["Version"],
+            "modified": meta["ModifiedClient"],
+            "path": path,
+        })
+
     return notebooks
 
 
 def _walk_directory(rmapi_bin: str, path: str, notebooks: list[dict]) -> None:
-    """Recursively walk a reMarkable directory, collecting notebooks."""
+    """Recursively walk a reMarkable directory, collecting notebooks (legacy, for tests)."""
     result = subprocess.run(
         [rmapi_bin, "ls", "--json", path],
         capture_output=True, text=True,
@@ -80,6 +140,155 @@ def _walk_directory(rmapi_bin: str, path: str, notebooks: list[dict]) -> None:
             _walk_directory(rmapi_bin, full_path, notebooks)
 
 
+def _render_rm_to_svg(rm_path: Path) -> str:
+    """Parse a .rm v6 file using rmscene and render strokes to SVG string."""
+    data = rm_path.read_bytes()
+    blocks = list(read_blocks(io.BytesIO(data)))
+    line_blocks = [b for b in blocks if isinstance(b, SceneLineItemBlock)]
+
+    # Color enum mapping
+    COLOR_MAP = {0: "black", 1: "#808080", 2: "white", 3: "#FFD700", 4: "#0000FF", 5: "#FF0000"}
+
+    # Shift coordinates: rm coords are centered on page (x=0 is center)
+    cx, cy = RM_WIDTH / 2, RM_HEIGHT / 2
+
+    # First pass: compute actual content bounds for scrollable pages
+    min_y, max_y = float('inf'), float('-inf')
+    strokes_svg = []
+    for lb in line_blocks:
+        item = lb.item
+        if item is None or item.value is None:
+            continue
+        line = item.value
+        points = line.points
+        if not points or len(points) < 2:
+            continue
+
+        color_val = line.color.value if hasattr(line.color, 'value') else 0
+        stroke_color = COLOR_MAP.get(color_val, "black")
+        stroke_width = max(1.0, line.thickness_scale * 2.0)
+
+        path_data = f"M {points[0].x + cx:.1f} {points[0].y + cy:.1f}"
+        for pt in points[1:]:
+            path_data += f" L {pt.x + cx:.1f} {pt.y + cy:.1f}"
+
+        for pt in points:
+            min_y = min(min_y, pt.y + cy)
+            max_y = max(max_y, pt.y + cy)
+
+        strokes_svg.append(
+            f'<path d="{path_data}" stroke="{stroke_color}" '
+            f'stroke-width="{stroke_width:.1f}" fill="none" '
+            f'stroke-linecap="round" stroke-linejoin="round"/>'
+        )
+
+    # Use actual content height if it exceeds the standard page
+    margin = 50
+    content_top = max(0, min_y - margin) if min_y != float('inf') else 0
+    content_bottom = max(RM_HEIGHT, max_y + margin) if max_y != float('-inf') else RM_HEIGHT
+    page_height = int(content_bottom - content_top)
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="0 {int(content_top)} {RM_WIDTH} {page_height}" '
+        f'width="{RM_WIDTH}" height="{page_height}">'
+        f'<rect x="0" y="{int(content_top)}" width="{RM_WIDTH}" height="{page_height}" fill="white"/>'
+        + "\n".join(strokes_svg)
+        + '</svg>'
+    )
+    return svg
+
+
+def _extract_rm_pages(rmapi_bin: str, notebook_path: str, output_dir: Path) -> list[Path] | None:
+    """Download notebook and extract ordered .rm files. Returns None for PDF-based notebooks."""
+    # Try geta first (works for PDF-based notebooks)
+    subprocess.run(
+        [rmapi_bin, "geta", notebook_path],
+        capture_output=True, text=True,
+        cwd=str(output_dir),
+    )
+
+    # Check for PDF output — no per-page tracking for PDFs
+    pdfs = list(output_dir.glob("*.pdf"))
+    if pdfs:
+        log.info("Exported annotated PDF: %s", pdfs[0].name)
+        return None
+
+    # geta may have downloaded a zip with .rm files instead
+    zips = list(output_dir.glob("*.zip"))
+    if not zips:
+        subprocess.run(
+            [rmapi_bin, "get", notebook_path],
+            capture_output=True, text=True,
+            cwd=str(output_dir),
+        )
+        zips = list(output_dir.glob("*.zip"))
+
+    if not zips:
+        log.error("No PDF or zip found after exporting %s", notebook_path)
+        return []
+
+    # Extract zip
+    extract_dir = output_dir / "extracted"
+    with zipfile.ZipFile(zips[0]) as zf:
+        zf.extractall(extract_dir)
+
+    # Find page order from .content file
+    content_files = list(extract_dir.glob("*.content"))
+    page_ids = []
+    if content_files:
+        try:
+            content = json.loads(content_files[0].read_text())
+            pages = content.get("cPages", {}).get("pages", [])
+            page_ids = [
+                p["id"] for p in pages
+                if not p.get("deleted", {}).get("value")
+            ]
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # Find and order .rm files
+    rm_files = list(extract_dir.rglob("*.rm"))
+    if not rm_files:
+        log.error("No .rm files found in zip for %s", notebook_path)
+        return []
+
+    if page_ids:
+        ordered = []
+        for pid in page_ids:
+            for rm in rm_files:
+                if rm.stem == pid:
+                    ordered.append(rm)
+                    break
+        rm_files = ordered if ordered else rm_files
+
+    return rm_files
+
+
+def export_notebook(rmapi_bin: str, notebook_path: str, name: str, output_dir: Path) -> list[Path]:
+    """Export a notebook. Returns list of renderable files (PDFs, SVGs, or PNGs)."""
+    rm_pages = _extract_rm_pages(rmapi_bin, notebook_path, output_dir)
+
+    if rm_pages is None:
+        # PDF-based notebook
+        return list(output_dir.glob("*.pdf"))
+
+    if not rm_pages:
+        return []
+
+    # Render each page to SVG
+    svg_paths = []
+    for i, rm_file in enumerate(rm_pages):
+        svg_content = _render_rm_to_svg(rm_file)
+        svg_path = output_dir / f"page_{i+1}.svg"
+        svg_path.write_text(svg_content)
+        svg_paths.append(svg_path)
+        log.info("Rendered page %d from %s", i + 1, rm_file.name)
+
+    return svg_paths
+
+
+# Keep old function name for test compatibility
 def export_notebook_pdf(rmapi_bin: str, notebook_path: str, name: str, output_dir: Path) -> Path | None:
     """Export a notebook as annotated PDF using rmapi geta. Returns path to PDF or None on failure."""
     result = subprocess.run(
@@ -92,7 +301,6 @@ def export_notebook_pdf(rmapi_bin: str, notebook_path: str, name: str, output_di
 
     pdf_path = output_dir / f"{name}.pdf"
     if not pdf_path.exists():
-        # rmapi may use a slightly different name; find any PDF in the dir
         pdfs = list(output_dir.glob("*.pdf"))
         if pdfs:
             pdf_path = pdfs[0]
@@ -104,9 +312,15 @@ def export_notebook_pdf(rmapi_bin: str, notebook_path: str, name: str, output_di
 
 TRANSCRIPTION_PROMPT = """Transcribe all handwritten text in this document to clean markdown.
 
+The images are numbered in order starting from 1 (image 1, image 2, etc.).
+
 Rules:
 - Infer structure: use headings, bullet lists, numbered lists as appropriate
-- Describe diagrams or sketches in blockquotes: > [Diagram: description]
+- For diagrams, sketches, or graphical elements that cannot be represented as text, output:
+  > [Diagram(page=P, top=T, bottom=B): description]
+  where P is the image number (1-based), T and B are the vertical position as
+  percentages (0=top of image, 100=bottom). This will be used to crop and embed
+  that region of the source image.
 - Mark illegible sections as *[illegible]*
 - Output ONLY the markdown transcription, no preamble or explanation"""
 
@@ -138,25 +352,201 @@ def transcribe_pdf(client, pdf_path: Path, model: str) -> str:
     return message.content[0].text
 
 
+MAX_IMAGE_DIM = 8000
+
+
+def _svg_to_png(svg_path: Path) -> bytes:
+    """Convert an SVG file to PNG bytes using cairosvg. Scales down if needed to fit API limits."""
+    import cairosvg
+
+    # Read SVG to check dimensions
+    svg_text = svg_path.read_text()
+    match = re.search(r'height="(\d+)"', svg_text)
+    svg_height = int(match.group(1)) if match else RM_HEIGHT
+    match = re.search(r'width="(\d+)"', svg_text)
+    svg_width = int(match.group(1)) if match else RM_WIDTH
+
+    # Scale down if either dimension exceeds API max (8000px)
+    output_width = svg_width
+    if svg_height > MAX_IMAGE_DIM or svg_width > MAX_IMAGE_DIM:
+        scale = min(MAX_IMAGE_DIM / svg_height, MAX_IMAGE_DIM / svg_width)
+        output_width = int(svg_width * scale)
+
+    return cairosvg.svg2png(url=str(svg_path), output_width=output_width)
+
+
+def _encode_page_image(page_path: Path) -> tuple[str, str]:
+    """Encode a page file to base64 and return (data, media_type)."""
+    suffix = page_path.suffix.lower()
+    if suffix == ".svg":
+        png_data = _svg_to_png(page_path)
+        return base64.standard_b64encode(png_data).decode("utf-8"), "image/png"
+    elif suffix == ".png":
+        return base64.standard_b64encode(page_path.read_bytes()).decode("utf-8"), "image/png"
+    else:
+        return base64.standard_b64encode(page_path.read_bytes()).decode("utf-8"), "application/pdf"
+
+
+SINGLE_PAGE_PROMPT = """Transcribe all handwritten text in this page to clean markdown.
+
+Rules:
+- Infer structure: use headings, bullet lists, numbered lists as appropriate
+- For diagrams, sketches, or graphical elements that cannot be represented as text, output:
+  > [Diagram(page=1, top=T, bottom=B): description]
+  where T and B are the vertical position as percentages (0=top, 100=bottom).
+  This will be used to crop and embed that region of the source image.
+- Mark illegible sections as *[illegible]*
+- Output ONLY the markdown transcription, no preamble or explanation"""
+
+
+def transcribe_page(client, page_path: Path, model: str) -> str:
+    """Send a single page image to Claude for transcription. Returns markdown string."""
+    page_data, media_type = _encode_page_image(page_path)
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=16384,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": page_data},
+                },
+                {"type": "text", "text": SINGLE_PAGE_PROMPT},
+            ],
+        }],
+    )
+    return message.content[0].text
+
+
+def transcribe_pages(client, page_paths: list[Path], model: str) -> str:
+    """Send page images (SVG/PNG) to Claude for transcription. Returns markdown string."""
+    content = []
+    for page_path in page_paths:
+        page_data, media_type = _encode_page_image(page_path)
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": page_data},
+        })
+
+    content.append({"type": "text", "text": TRANSCRIPTION_PROMPT})
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=16384,
+        messages=[{"role": "user", "content": content}],
+    )
+    return message.content[0].text
+
+
+DIAGRAM_RE = re.compile(
+    r'> \[Diagram\(page=(\d+),\s*top=(\d+),\s*bottom=(\d+)\):\s*(.+?)\]'
+)
+
+
+def extract_diagram_crops(
+    markdown: str,
+    page_paths: list[Path],
+    vault_path: str,
+    notebook_name: str,
+) -> tuple[str, list[str]]:
+    """Find Diagram markers in markdown, crop source images, return updated markdown and saved filenames."""
+    from PIL import Image
+
+    attachments = Path(vault_path) / "Attachments" / "reMarkable"
+    attachments.mkdir(parents=True, exist_ok=True)
+    safe_name = sanitize_filename(notebook_name)
+
+    saved_crops = []
+    crop_counter = 0
+
+    def replace_diagram(match):
+        nonlocal crop_counter
+        page_num = int(match.group(1))
+        top_pct = int(match.group(2))
+        bottom_pct = int(match.group(3))
+        description = match.group(4).strip()
+
+        if page_num < 1 or page_num > len(page_paths):
+            return match.group(0)  # leave as-is if page out of range
+
+        page_path = page_paths[page_num - 1]
+        try:
+            # Load the PNG (convert SVG first if needed)
+            if page_path.suffix.lower() == ".svg":
+                png_data = _svg_to_png(page_path)
+                img = Image.open(io.BytesIO(png_data))
+            else:
+                img = Image.open(page_path)
+
+            width, height = img.size
+            # Add some padding around the crop region
+            pad = int(height * 0.02)
+            y_top = max(0, int(height * top_pct / 100) - pad)
+            y_bottom = min(height, int(height * bottom_pct / 100) + pad)
+
+            cropped = img.crop((0, y_top, width, y_bottom))
+
+            crop_counter += 1
+            crop_name = f"{safe_name} - diagram {crop_counter}.png"
+            crop_path = attachments / crop_name
+            cropped.save(str(crop_path), "PNG")
+            saved_crops.append(crop_name)
+            log.info("Cropped diagram %d from page %d (%d%%-%d%%)", crop_counter, page_num, top_pct, bottom_pct)
+
+            return f"> *{description}*\n\n![[{crop_name}]]"
+        except Exception:
+            log.warning("Failed to crop diagram from page %d", page_num, exc_info=True)
+            return match.group(0)
+
+    updated_markdown = DIAGRAM_RE.sub(replace_diagram, markdown)
+    return updated_markdown, saved_crops
+
+
 def sanitize_filename(name: str) -> str:
     """Keep alphanumeric, spaces, hyphens, underscores; replace others with _."""
     return re.sub(r"[^a-zA-Z0-9 _-]", "_", name)
 
 
-def write_obsidian_note(vault_path: str, notebook: dict, markdown: str) -> Path:
+def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path]) -> list[str]:
+    """Save source page images to the vault Attachments folder. Returns list of filenames."""
+    attachments = Path(vault_path) / "Attachments" / "reMarkable"
+    attachments.mkdir(parents=True, exist_ok=True)
+
+    safe_name = sanitize_filename(notebook["name"])
+    saved = []
+    for i, page_path in enumerate(page_paths):
+        suffix = page_path.suffix.lower()
+        if suffix == ".svg":
+            # Convert SVG to PNG for display in Obsidian
+            png_data = _svg_to_png(page_path)
+            dest_name = f"{safe_name} - page {i+1}.png"
+            (attachments / dest_name).write_bytes(png_data)
+        elif suffix == ".pdf":
+            dest_name = f"{safe_name}.pdf"
+            shutil.copy2(page_path, attachments / dest_name)
+        else:
+            dest_name = f"{safe_name} - page {i+1}{suffix}"
+            shutil.copy2(page_path, attachments / dest_name)
+        saved.append(dest_name)
+        log.info("Saved source: %s", dest_name)
+
+    return saved
+
+
+def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_files: list[str] | None = None) -> Path:
     """Write a markdown note with YAML frontmatter to the Obsidian vault inbox."""
-    inbox = Path(vault_path) / "Inbox" / "reMarkable"
+    inbox = Path(vault_path) / "Remarkable Notes"
     inbox.mkdir(parents=True, exist_ok=True)
 
-    modified = datetime.fromisoformat(notebook["modified"].replace("Z", "+00:00"))
-    timestamp = modified.strftime("%Y-%m-%d %H%M")
     safe_name = sanitize_filename(notebook["name"])
-    filename = f"{timestamp} {safe_name}.md"
+    filename = f"{safe_name}.md"
 
     frontmatter = (
         f'---\n'
         f'title: "{notebook["name"]}"\n'
-        f'created: {notebook["modified"]}\n'
+        f'modified: {notebook["modified"]}\n'
         f'source: reMarkable\n'
         f'remarkable_id: "{notebook["id"]}"\n'
         f'tags:\n'
@@ -165,9 +555,21 @@ def write_obsidian_note(vault_path: str, notebook: dict, markdown: str) -> Path:
         f'---\n'
     )
 
+    body = "\n" + markdown + "\n"
+
+    if source_files:
+        body += "\n---\n\n## Handwritten source\n\n"
+        for fname in source_files:
+            body += f"![[{fname}]]\n\n"
+
     note_path = inbox / filename
-    note_path.write_text(frontmatter + "\n" + markdown + "\n")
+    note_path.write_text(frontmatter + body)
     return note_path
+
+
+def _hash_file(path: Path) -> str:
+    """Return SHA-256 hex digest of a file's contents."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def sync_notebooks(
@@ -180,28 +582,113 @@ def sync_notebooks(
     client,
     state_file: str,
 ) -> None:
-    """Process each notebook: skip unchanged, export, transcribe, write."""
+    """Process each notebook: skip unchanged, export, transcribe changed pages, write."""
     for nb in notebooks:
-        if state.get(nb["id"]) == nb["version"]:
+        nb_state = state.get(nb["id"], {})
+
+        # Legacy state format migration: old format was {id: version}
+        if not isinstance(nb_state, dict):
+            nb_state = {}
+
+        if nb_state.get("version") == nb["version"]:
             log.info("Skipping %s (unchanged, version %s)", nb["name"], nb["version"])
             continue
 
         log.info("Processing: %s", nb["name"])
         tmp_dir = Path(tempfile.mkdtemp())
         try:
-            pdf_path = export_notebook_pdf(rmapi_bin, nb["path"], nb["name"], tmp_dir)
-            if pdf_path is None:
+            # Extract raw .rm pages (returns None for PDF notebooks)
+            rm_pages = _extract_rm_pages(rmapi_bin, nb["path"], tmp_dir)
+
+            if rm_pages is None:
+                # PDF-based notebook — no per-page tracking, full re-transcription
+                pdfs = list(tmp_dir.glob("*.pdf"))
+                if not pdfs:
+                    continue
+                if dry_run:
+                    log.info("[DRY RUN] Would transcribe %s (PDF, %d bytes)", nb["name"], pdfs[0].stat().st_size)
+                    continue
+                markdown = transcribe_pdf(client, pdfs[0], model)
+                markdown, _ = extract_diagram_crops(markdown, pdfs, vault_path, nb["name"])
+                source_files = save_source_pages(vault_path, nb, pdfs)
+                note_path = write_obsidian_note(vault_path, nb, markdown, source_files)
+                log.info("Wrote %s (%d chars)", note_path, len(markdown))
+                state[nb["id"]] = {"version": nb["version"]}
+                save_state(state_file, state)
+                continue
+
+            if not rm_pages:
+                continue
+
+            # Per-page change detection
+            cached_pages = nb_state.get("pages", {})
+            page_hashes = {}
+            changed_indices = []
+
+            for i, rm_file in enumerate(rm_pages):
+                h = _hash_file(rm_file)
+                page_hashes[str(i)] = h
+                cached = cached_pages.get(str(i), {})
+                if cached.get("hash") != h:
+                    changed_indices.append(i)
+
+            # Detect removed pages
+            current_count = len(rm_pages)
+            old_count = len(cached_pages)
+            removed = current_count < old_count
+
+            if not changed_indices and not removed:
+                log.info("Skipping %s (no page content changed)", nb["name"])
+                state[nb["id"]] = {"version": nb["version"], "pages": cached_pages}
+                save_state(state_file, state)
                 continue
 
             if dry_run:
-                log.info("[DRY RUN] Would transcribe %s (%d bytes)", nb["name"], pdf_path.stat().st_size)
+                log.info("[DRY RUN] Would transcribe %d/%d changed pages in %s",
+                         len(changed_indices), len(rm_pages), nb["name"])
                 continue
 
-            markdown = transcribe_pdf(client, pdf_path, model)
-            note_path = write_obsidian_note(vault_path, nb, markdown)
-            log.info("Wrote %s (%d chars)", note_path, len(markdown))
+            # Render all pages to SVG (needed for source images)
+            svg_paths = []
+            for i, rm_file in enumerate(rm_pages):
+                svg_content = _render_rm_to_svg(rm_file)
+                svg_path = tmp_dir / f"page_{i+1}.svg"
+                svg_path.write_text(svg_content)
+                svg_paths.append(svg_path)
 
-            state[nb["id"]] = nb["version"]
+            # Transcribe only changed pages, reuse cached markdown for others
+            page_markdowns = {}
+            for i in range(len(rm_pages)):
+                if i in changed_indices:
+                    log.info("Transcribing page %d/%d (changed)", i + 1, len(rm_pages))
+                    md = transcribe_page(client, svg_paths[i], model)
+                    # Fix diagram page references to use page=1 since we send one at a time
+                    md = md.replace("page=1", f"page={i+1}")
+                    page_markdowns[str(i)] = md
+                else:
+                    log.info("Reusing cached transcription for page %d/%d", i + 1, len(rm_pages))
+                    page_markdowns[str(i)] = cached_pages[str(i)]["markdown"]
+
+            # Assemble full markdown
+            all_parts = [page_markdowns[str(i)] for i in range(len(rm_pages))]
+            markdown = "\n\n---\n\n".join(all_parts)
+
+            # Extract and crop any diagram regions
+            markdown, _ = extract_diagram_crops(markdown, svg_paths, vault_path, nb["name"])
+
+            source_files = save_source_pages(vault_path, nb, svg_paths)
+            note_path = write_obsidian_note(vault_path, nb, markdown, source_files)
+            log.info("Wrote %s (%d chars, %d/%d pages transcribed)",
+                     note_path, len(markdown), len(changed_indices), len(rm_pages))
+
+            # Save per-page state
+            new_pages = {}
+            for i in range(len(rm_pages)):
+                new_pages[str(i)] = {
+                    "hash": page_hashes[str(i)],
+                    "markdown": page_markdowns[str(i)],
+                }
+            state[nb["id"]] = {"version": nb["version"], "pages": new_pages}
             save_state(state_file, state)
         except Exception:
             log.error("Failed to process %s", nb["name"], exc_info=True)
@@ -226,8 +713,17 @@ def main():
     notebooks = list_notebooks(config["rmapi_bin"], config["watch_path"])
     log.info("Found %d notebooks", len(notebooks))
 
-    import anthropic
-    client = anthropic.Anthropic() if not args.dry_run else None
+    client = None
+    if not args.dry_run:
+        import anthropic
+        if os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1":
+            from anthropic import AnthropicVertex
+            client = AnthropicVertex(
+                project_id=os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "spotify-claude-code-trial"),
+                region=os.environ.get("CLOUD_ML_REGION", "europe-west1"),
+            )
+        else:
+            client = anthropic.Anthropic()
     sync_notebooks(
         notebooks, state, config["obsidian_vault"], config["rmapi_bin"],
         config["model"], args.dry_run, client, config["state_file"],

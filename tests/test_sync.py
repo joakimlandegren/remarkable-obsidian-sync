@@ -17,11 +17,11 @@ def test_config_defaults():
     from remarkable_to_obsidian import load_config
 
     config = load_config()
-    assert config["obsidian_vault"].endswith("obsidian-vault")
+    assert config["obsidian_vault"].endswith("joakimlandegren")
     assert config["rmapi_bin"] == "rmapi"
     assert config["state_file"].endswith(".remarkable_sync_state.json")
     assert config["watch_path"] == "/"
-    assert config["model"] == "claude-opus-4-6"
+    assert config["model"] == "claude-opus-4-6"  # default for Vertex compatibility
 
 
 def test_config_from_env(monkeypatch):
@@ -82,57 +82,93 @@ def test_load_state_corrupt_file(tmp_path):
 from remarkable_to_obsidian import list_notebooks
 
 
-def _mock_rmapi_ls(responses: dict):
-    """Create a mock for subprocess.run that returns rmapi ls --json responses."""
+def _mock_rmapi_find_stat(notebooks_by_path: dict[str, dict]):
+    """Create a mock for subprocess.run that handles rmapi find + stat.
+
+    notebooks_by_path maps full path -> metadata dict with keys:
+    ID, Name, Version, ModifiedClient.
+    """
     def side_effect(cmd, **kwargs):
-        # Extract path from command: ["rmapi", "ls", "--json", path]
-        path = cmd[3] if len(cmd) > 3 else "/"
         result = MagicMock()
         result.returncode = 0
-        result.stdout = json.dumps(responses.get(path, []))
+
+        if cmd[1] == "find":
+            # Return "[f] /path" lines for each notebook
+            lines = [f"[f] {path}" for path in notebooks_by_path]
+            result.stdout = "\n".join(lines) + "\n" if lines else ""
+            return result
+        elif cmd[1] == "stat":
+            path = cmd[2]
+            meta = notebooks_by_path.get(path)
+            if meta:
+                result.stdout = json.dumps(meta)
+            else:
+                result.returncode = 1
+            return result
+
+        result.stdout = ""
         return result
     return side_effect
 
 
 def test_list_notebooks_flat():
     """Lists notebooks in a flat directory."""
-    responses = {
-        "/": [
-            {"id": "abc-123", "name": "Meeting Notes", "type": "DocumentType", "version": 3, "modifiedClient": "2025-01-15T10:30:00Z"},
-            {"id": "def-456", "name": "Sketches", "type": "DocumentType", "version": 1, "modifiedClient": "2025-01-10T08:00:00Z"},
-        ]
+    notebooks = {
+        "/Meeting Notes": {"ID": "abc-123", "Name": "Meeting Notes", "Version": 3, "ModifiedClient": "2025-01-15T10:30:00Z"},
+        "/Sketches": {"ID": "def-456", "Name": "Sketches", "Version": 1, "ModifiedClient": "2025-01-10T08:00:00Z"},
     }
-    with patch("subprocess.run", side_effect=_mock_rmapi_ls(responses)):
-        notebooks = list_notebooks("rmapi", "/")
+    with patch("subprocess.run", side_effect=_mock_rmapi_find_stat(notebooks)):
+        result = list_notebooks("rmapi", "/")
 
-    assert len(notebooks) == 2
-    assert notebooks[0]["id"] == "abc-123"
-    assert notebooks[0]["path"] == "/Meeting Notes"
-    assert notebooks[1]["path"] == "/Sketches"
+    assert len(result) == 2
+    assert result[0]["id"] == "abc-123"
+    assert result[0]["path"] == "/Meeting Notes"
+    assert result[1]["path"] == "/Sketches"
 
 
 def test_list_notebooks_recursive():
-    """Recursively lists notebooks in nested directories."""
-    responses = {
-        "/": [
-            {"id": "dir-1", "name": "Work", "type": "CollectionType", "version": 1, "modifiedClient": "2025-01-01T00:00:00Z"},
-        ],
-        "/Work": [
-            {"id": "nb-1", "name": "Project Plan", "type": "DocumentType", "version": 2, "modifiedClient": "2025-01-20T14:00:00Z"},
-        ],
+    """Lists notebooks in nested directories (find returns all recursively)."""
+    notebooks = {
+        "/Work/Project Plan": {"ID": "nb-1", "Name": "Project Plan", "Version": 2, "ModifiedClient": "2025-01-20T14:00:00Z"},
     }
-    with patch("subprocess.run", side_effect=_mock_rmapi_ls(responses)):
-        notebooks = list_notebooks("rmapi", "/")
+    with patch("subprocess.run", side_effect=_mock_rmapi_find_stat(notebooks)):
+        result = list_notebooks("rmapi", "/")
 
-    assert len(notebooks) == 1
-    assert notebooks[0]["id"] == "nb-1"
-    assert notebooks[0]["path"] == "/Work/Project Plan"
+    assert len(result) == 1
+    assert result[0]["id"] == "nb-1"
+    assert result[0]["path"] == "/Work/Project Plan"
+
+
+def test_list_notebooks_watch_path_filter():
+    """Only returns notebooks under the watch_path."""
+    notebooks = {
+        "/Work/Project Plan": {"ID": "nb-1", "Name": "Project Plan", "Version": 2, "ModifiedClient": "2025-01-20T14:00:00Z"},
+        "/Personal/Diary": {"ID": "nb-2", "Name": "Diary", "Version": 1, "ModifiedClient": "2025-01-10T08:00:00Z"},
+    }
+    with patch("subprocess.run", side_effect=_mock_rmapi_find_stat(notebooks)):
+        result = list_notebooks("rmapi", "/Work")
+
+    assert len(result) == 1
+    assert result[0]["id"] == "nb-1"
+
+
+def test_list_notebooks_skips_trash():
+    """Skips notebooks in /trash/."""
+    notebooks = {
+        "/Meeting Notes": {"ID": "abc-123", "Name": "Meeting Notes", "Version": 3, "ModifiedClient": "2025-01-15T10:30:00Z"},
+        "/trash/Deleted": {"ID": "del-1", "Name": "Deleted", "Version": 1, "ModifiedClient": "2025-01-01T00:00:00Z"},
+    }
+    with patch("subprocess.run", side_effect=_mock_rmapi_find_stat(notebooks)):
+        result = list_notebooks("rmapi", "/")
+
+    assert len(result) == 1
+    assert result[0]["id"] == "abc-123"
 
 
 def test_list_notebooks_auth_failure():
     """Raises SystemExit when rmapi fails (auth issue)."""
     with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=1, stderr="auth error")
+        mock_run.return_value = MagicMock(returncode=1, stderr="auth error", stdout="")
         with pytest.raises(SystemExit):
             list_notebooks("rmapi", "/")
 
@@ -224,15 +260,17 @@ def test_write_obsidian_note(tmp_path):
     path = write_obsidian_note(str(vault), notebook, markdown)
 
     assert path.exists()
+    assert path.name == "Meeting Notes.md"
     content = path.read_text()
     assert content.startswith("---\n")
     assert 'title: "Meeting Notes"' in content
     assert 'remarkable_id: "abc-123"' in content
+    assert "modified: 2025-01-15T10:30:00Z" in content
     assert "source: reMarkable" in content
     assert "- handwritten" in content
     assert "- inbox" in content
     assert content.endswith("- Discussed roadmap\n")
-    assert "Inbox/reMarkable" in str(path.parent)
+    assert "Remarkable Notes" in str(path.parent)
 
 
 # --- Sync orchestration tests ---
@@ -245,15 +283,27 @@ def test_sync_skips_unchanged(tmp_path, capsys):
     notebooks = [
         {"id": "abc-123", "name": "Old Notes", "version": 3, "modified": "2025-01-15T10:30:00Z", "path": "/Old Notes"},
     ]
-    state = {"abc-123": 3}  # Same version — should skip
+    state = {"abc-123": {"version": 3, "pages": {}}}  # Same version — should skip
 
-    with patch("remarkable_to_obsidian.export_notebook_pdf") as mock_export:
+    with patch("remarkable_to_obsidian._extract_rm_pages") as mock_extract:
         sync_notebooks(notebooks, state, "/tmp/vault", "rmapi", "claude-opus-4-6", dry_run=False, client=MagicMock(), state_file="/tmp/state.json")
-        mock_export.assert_not_called()
+        mock_extract.assert_not_called()
+
+
+def test_sync_skips_unchanged_legacy_state(tmp_path, capsys):
+    """Handles legacy state format (plain version number) by re-processing."""
+    notebooks = [
+        {"id": "abc-123", "name": "Old Notes", "version": 3, "modified": "2025-01-15T10:30:00Z", "path": "/Old Notes"},
+    ]
+    state = {"abc-123": 3}  # Legacy format — should NOT skip (needs migration)
+
+    with patch("remarkable_to_obsidian._extract_rm_pages", return_value=[]) as mock_extract:
+        sync_notebooks(notebooks, state, "/tmp/vault", "rmapi", "claude-opus-4-6", dry_run=False, client=MagicMock(), state_file="/tmp/state.json")
+        mock_extract.assert_called_once()
 
 
 def test_sync_processes_new_notebook(tmp_path):
-    """Processes notebooks not in state."""
+    """Processes notebooks not in state (PDF-based notebook)."""
     notebooks = [
         {"id": "new-1", "name": "New Notes", "version": 1, "modified": "2025-01-20T09:00:00Z", "path": "/New Notes"},
     ]
@@ -267,12 +317,63 @@ def test_sync_processes_new_notebook(tmp_path):
     fake_pdf = tmp_path / "New Notes.pdf"
     fake_pdf.write_bytes(b"%PDF-1.4 fake")
 
-    with patch("remarkable_to_obsidian.export_notebook_pdf", return_value=fake_pdf) as mock_export, \
+    with patch("remarkable_to_obsidian._extract_rm_pages", return_value=None) as mock_extract, \
          patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
          patch("remarkable_to_obsidian.save_state") as mock_save, \
          patch("tempfile.mkdtemp", return_value=str(tmp_path)):
         sync_notebooks(notebooks, state, str(tmp_path / "vault"), "rmapi", "claude-opus-4-6", dry_run=False, client=mock_client, state_file="/tmp/state.json")
 
-    mock_export.assert_called_once()
+    mock_extract.assert_called_once()
     mock_write.assert_called_once()
-    assert state["new-1"] == 1  # State updated
+    assert state["new-1"] == {"version": 1}
+
+
+def test_sync_incremental_pages(tmp_path):
+    """Only re-transcribes pages whose content hash changed."""
+    import hashlib
+
+    # Create two fake .rm files
+    rm_dir = tmp_path / "extracted" / "uuid"
+    rm_dir.mkdir(parents=True)
+    rm1 = rm_dir / "page1.rm"
+    rm2 = rm_dir / "page2.rm"
+    rm1.write_bytes(b"page1 content unchanged")
+    rm2.write_bytes(b"page2 content NEW")
+
+    hash1 = hashlib.sha256(b"page1 content unchanged").hexdigest()
+    old_hash2 = hashlib.sha256(b"page2 content old").hexdigest()
+
+    notebooks = [
+        {"id": "nb-1", "name": "Test", "version": 2, "modified": "2025-01-20T09:00:00Z", "path": "/Test"},
+    ]
+    state = {
+        "nb-1": {
+            "version": 1,
+            "pages": {
+                "0": {"hash": hash1, "markdown": "# Page 1 cached"},
+                "1": {"hash": old_hash2, "markdown": "# Page 2 old"},
+            },
+        },
+    }
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="# Page 2 updated")]
+    mock_client.messages.create.return_value = mock_response
+
+    with patch("remarkable_to_obsidian._extract_rm_pages", return_value=[rm1, rm2]), \
+         patch("remarkable_to_obsidian._render_rm_to_svg", return_value='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1404 1872" width="1404" height="1872"><rect width="100%" height="100%" fill="white"/></svg>'), \
+         patch("remarkable_to_obsidian.save_source_pages", return_value=[]), \
+         patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
+         patch("remarkable_to_obsidian.save_state"), \
+         patch("tempfile.mkdtemp", return_value=str(tmp_path)):
+        sync_notebooks(notebooks, state, str(tmp_path / "vault"), "rmapi", "claude-opus-4-6", dry_run=False, client=mock_client, state_file="/tmp/state.json")
+
+    # Only page 2 should have been sent to Claude
+    assert mock_client.messages.create.call_count == 1
+    mock_write.assert_called_once()
+
+    # Verify the assembled markdown contains both pages
+    written_md = mock_write.call_args.args[2]
+    assert "# Page 1 cached" in written_md
+    assert "# Page 2 updated" in written_md
