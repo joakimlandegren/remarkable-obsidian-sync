@@ -8,4 +8,4 @@ if [ "$HOUR" -lt 8 ] || [ "$HOUR" -ge 22 ]; then
 fi
 
 cd "$(dirname "$0")"
-/Users/joakiml/.local/bin/uv run python remarkable_to_obsidian.py 2>&1
+uv run python remarkable_to_obsidian.py 2>&1
