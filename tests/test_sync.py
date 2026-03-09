@@ -17,6 +17,7 @@ from remarkable_to_obsidian import (
     _hash_file,
     _load_dotenv,
     _move_obsidian_note,
+    _move_obsidian_note_legacy,
     _svg_to_png,
     export_notebook,
     export_notebook_pdf,
@@ -407,6 +408,53 @@ def test_move_obsidian_note_cleans_empty_dir(tmp_path):
     _move_obsidian_note(str(vault), "/OldFolder/Note", "Note", notebook)
 
     assert not old_dir.exists()  # empty dir removed
+
+
+def test_move_obsidian_note_legacy_finds_and_moves(tmp_path):
+    """Legacy migration finds note by name and moves it to current reMarkable path."""
+    vault = tmp_path / "vault"
+    old_dir = vault / "Remarkable Notes" / "OldFolder"
+    old_dir.mkdir(parents=True)
+    old_file = old_dir / "Meeting.md"
+    old_file.write_text("content")
+
+    notebook = {"name": "Meeting", "path": "/Archive/2025/Meeting"}
+    _move_obsidian_note_legacy(str(vault), notebook)
+
+    new_file = vault / "Remarkable Notes" / "Archive" / "2025" / "Meeting.md"
+    assert new_file.exists()
+    assert not old_file.exists()
+    assert new_file.read_text() == "content"
+
+
+def test_move_obsidian_note_legacy_already_correct(tmp_path):
+    """Legacy migration skips when note is already in the right place."""
+    vault = tmp_path / "vault"
+    correct_dir = vault / "Remarkable Notes" / "Notes"
+    correct_dir.mkdir(parents=True)
+    correct_file = correct_dir / "Meeting.md"
+    correct_file.write_text("content")
+
+    notebook = {"name": "Meeting", "path": "/Notes/Meeting"}
+    _move_obsidian_note_legacy(str(vault), notebook)
+
+    assert correct_file.exists()  # unchanged
+
+
+def test_move_obsidian_note_legacy_multiple_matches(tmp_path):
+    """Legacy migration skips when multiple notes with same name exist."""
+    vault = tmp_path / "vault"
+    for folder in ["FolderA", "FolderB"]:
+        d = vault / "Remarkable Notes" / folder
+        d.mkdir(parents=True)
+        (d / "Meeting.md").write_text("content")
+
+    notebook = {"name": "Meeting", "path": "/Archive/Meeting"}
+    _move_obsidian_note_legacy(str(vault), notebook)
+
+    # Both originals should still exist — no move attempted
+    assert (vault / "Remarkable Notes" / "FolderA" / "Meeting.md").exists()
+    assert (vault / "Remarkable Notes" / "FolderB" / "Meeting.md").exists()
 
 
 # --- Sync orchestration tests ---

@@ -777,6 +777,41 @@ def _move_obsidian_note(vault_path: str, old_rm_path: str, old_name: str, notebo
         pass
 
 
+def _move_obsidian_note_legacy(vault_path: str, notebook: dict) -> None:
+    """Move an Obsidian note when state has no stored path (legacy/first-run migration).
+
+    Searches for an existing note by filename under Remarkable Notes/ and moves it
+    to the location implied by the notebook's current reMarkable path.
+    """
+    vault = Path(vault_path)
+    base = vault / "Remarkable Notes"
+    safe_name = f"{sanitize_filename(notebook['name'])}.md"
+
+    # Where the note *should* be based on current reMarkable path
+    new_parent = str(Path(notebook["path"]).parent).lstrip("/")
+    new_dir = base / new_parent if new_parent and new_parent != "." else base
+    new_file = new_dir / safe_name
+
+    if new_file.exists():
+        return  # already in the right place
+
+    # Search for the note anywhere under Remarkable Notes/
+    matches = list(base.rglob(safe_name))
+    if len(matches) == 1:
+        old_file = matches[0]
+        old_dir = old_file.parent
+        new_dir.mkdir(parents=True, exist_ok=True)
+        old_file.rename(new_file)
+        log.info("Moved %s → %s (legacy migration)",
+                 old_file.relative_to(vault), new_file.relative_to(vault))
+        try:
+            old_dir.rmdir()
+        except OSError:
+            pass
+    elif len(matches) > 1:
+        log.warning("Multiple notes named %s found — skipping legacy move", safe_name)
+
+
 def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_files: list[str] | None = None) -> Path:
     """Write a markdown note with YAML frontmatter to the Obsidian vault inbox."""
     # Preserve reMarkable folder structure under Remarkable Notes/
@@ -862,6 +897,9 @@ def sync_notebooks(
         old_name = nb_state.get("name")
         if old_path and (old_path != nb["path"] or old_name != nb["name"]):
             _move_obsidian_note(vault_path, old_path, old_name or Path(old_path).name, nb)
+        elif not old_path and nb_state:
+            # Legacy state without stored path — search for existing note by name
+            _move_obsidian_note_legacy(vault_path, nb)
 
         if nb_state.get("version") == nb["version"]:
             # Update stored path/name even when skipping content sync
