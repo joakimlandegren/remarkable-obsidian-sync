@@ -38,6 +38,10 @@ _load_dotenv()
 
 log = logging.getLogger(__name__)
 
+# Cache for page tags extracted from .content files during _extract_rm_pages.
+# Keyed by notebook_path, consumed by sync_notebooks.
+_content_tags: dict[str, list[str]] = {}
+
 
 def load_ignore_patterns() -> list[str]:
     """Load glob patterns from .sync_ignore file. One pattern per line, # for comments."""
@@ -288,6 +292,22 @@ def _render_rm_to_svg(rm_path: Path) -> str:
     return svg
 
 
+def _extract_content_tags(zip_path: Path, notebook_path: str) -> None:
+    """Extract pageTags from a .content file inside a zip/rmdoc and cache them."""
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for name in zf.namelist():
+                if name.endswith(".content"):
+                    content = json.loads(zf.read(name))
+                    page_tags = content.get("pageTags", [])
+                    tag_names = list({t["name"] for t in page_tags if "name" in t})
+                    if tag_names:
+                        _content_tags[notebook_path] = tag_names
+                    break
+    except (zipfile.BadZipFile, json.JSONDecodeError, KeyError):
+        pass
+
+
 def _extract_rm_pages(rmapi_bin: str, notebook_path: str, output_dir: Path) -> list[Path] | None:
     """Download notebook and extract ordered .rm files. Returns None for PDF-based notebooks."""
     # Try geta first (works for PDF-based notebooks)
@@ -301,17 +321,21 @@ def _extract_rm_pages(rmapi_bin: str, notebook_path: str, output_dir: Path) -> l
     pdfs = list(output_dir.glob("*.pdf"))
     if pdfs:
         log.info("Exported annotated PDF: %s", pdfs[0].name)
+        # Still try to extract pageTags from any .rmdoc left alongside the PDF
+        rmdocs = list(output_dir.glob("*.rmdoc"))
+        if rmdocs:
+            _extract_content_tags(rmdocs[0], notebook_path)
         return None
 
-    # geta may have downloaded a zip with .rm files instead
-    zips = list(output_dir.glob("*.zip"))
+    # geta may have downloaded a zip/.rmdoc with .rm files instead
+    zips = list(output_dir.glob("*.zip")) + list(output_dir.glob("*.rmdoc"))
     if not zips:
         subprocess.run(
             [rmapi_bin, "get", notebook_path],
             capture_output=True, text=True,
             cwd=str(output_dir),
         )
-        zips = list(output_dir.glob("*.zip"))
+        zips = list(output_dir.glob("*.zip")) + list(output_dir.glob("*.rmdoc"))
 
     if not zips:
         log.error("No PDF or zip found after exporting %s", notebook_path)
@@ -335,6 +359,9 @@ def _extract_rm_pages(rmapi_bin: str, notebook_path: str, output_dir: Path) -> l
             ]
         except (json.JSONDecodeError, KeyError):
             pass
+
+    # Extract pageTags from .content (reMarkable stores user tags here, not in API metadata)
+    _extract_content_tags(zips[0], notebook_path)
 
     # Find and order .rm files
     rm_files = list(extract_dir.rglob("*.rm"))
@@ -913,6 +940,12 @@ def sync_notebooks(
         try:
             # Extract raw .rm pages (returns None for PDF notebooks)
             rm_pages = _extract_rm_pages(rmapi_bin, nb["path"], tmp_dir)
+
+            # Merge page tags from .content file (rmapi stat doesn't return these)
+            content_tags = _content_tags.pop(nb["path"], [])
+            if content_tags:
+                existing = nb.get("tags", [])
+                nb["tags"] = list({*existing, *content_tags})
 
             if rm_pages is None:
                 # PDF-based notebook — no per-page tracking, full re-transcription

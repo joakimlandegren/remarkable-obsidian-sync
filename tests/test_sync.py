@@ -13,6 +13,8 @@ import pytest
 from remarkable_to_obsidian import (
     DIAGRAM_RE,
     _encode_page_image,
+    _content_tags,
+    _extract_content_tags,
     _extract_rm_pages,
     _hash_file,
     _load_dotenv,
@@ -958,6 +960,44 @@ def test_save_source_pages_svg(tmp_path):
     saved = vault / "Attachments" / "reMarkable" / "Drawing - page 1.png"
     assert saved.exists()
     assert saved.read_bytes() == b"\x89PNG converted"
+
+
+# --- Content tag extraction tests ---
+
+
+def test_extract_content_tags_from_rmdoc(tmp_path):
+    """Extracts pageTags from .content file inside a zip/rmdoc."""
+    content_data = json.dumps({
+        "pageTags": [
+            {"name": "strategy", "pageId": "page-1", "timestamp": 123},
+            {"name": "important", "pageId": "page-2", "timestamp": 456},
+            {"name": "strategy", "pageId": "page-3", "timestamp": 789},  # duplicate
+        ],
+        "tags": [],
+    })
+
+    rmdoc = tmp_path / "notebook.rmdoc"
+    with zipfile.ZipFile(rmdoc, "w") as zf:
+        zf.writestr("abc-123.content", content_data)
+
+    _content_tags.clear()
+    _extract_content_tags(rmdoc, "/Test/Notebook")
+    assert "/Test/Notebook" in _content_tags
+    assert sorted(_content_tags["/Test/Notebook"]) == ["important", "strategy"]
+    _content_tags.clear()
+
+
+def test_extract_content_tags_empty(tmp_path):
+    """No tags cached when pageTags is empty."""
+    content_data = json.dumps({"pageTags": [], "tags": []})
+    rmdoc = tmp_path / "notebook.rmdoc"
+    with zipfile.ZipFile(rmdoc, "w") as zf:
+        zf.writestr("abc-123.content", content_data)
+
+    _content_tags.clear()
+    _extract_content_tags(rmdoc, "/Test/Notebook")
+    assert "/Test/Notebook" not in _content_tags
+    _content_tags.clear()
 
 
 # --- Extract .rm pages tests ---
