@@ -146,6 +146,9 @@ def list_notebooks(rmapi_bin: str, watch_path: str) -> list[dict]:
             "version": meta["Version"],
             "modified": meta["ModifiedClient"],
             "path": path,
+            "starred": meta.get("Starred", False),
+            "tags": meta.get("Tags") or [],
+            "type": meta.get("Type", "DocumentType"),
         })
 
     return notebooks
@@ -529,7 +532,8 @@ def transcribe_pages(client, page_paths: list[Path], model: str) -> str:
 
 
 DIAGRAM_RE = re.compile(
-    r'> \[Diagram\(page=(\d+),\s*top=(\d+),\s*bottom=(\d+)\):\s*(.+?)\]'
+    r'> \[Diagram\(page=(\d+),\s*top=(\d+),\s*bottom=(\d+)\):\s*(.+?)\]',
+    re.DOTALL,
 )
 
 DIAGRAM_CONVERT_PROMPT = """Look at this handwritten diagram. Reproduce it as accurately as possible.
@@ -741,6 +745,38 @@ def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path]) -
     return saved
 
 
+def _move_obsidian_note(vault_path: str, old_rm_path: str, old_name: str, notebook: dict) -> None:
+    """Move an Obsidian note when its reMarkable notebook has been moved or renamed."""
+    vault = Path(vault_path)
+    base = vault / "Remarkable Notes"
+
+    # Compute old location
+    old_parent = str(Path(old_rm_path).parent).lstrip("/")
+    old_dir = base / old_parent if old_parent and old_parent != "." else base
+    old_file = old_dir / f"{sanitize_filename(old_name)}.md"
+
+    # Compute new location
+    new_parent = str(Path(notebook["path"]).parent).lstrip("/")
+    new_dir = base / new_parent if new_parent and new_parent != "." else base
+    new_file = new_dir / f"{sanitize_filename(notebook['name'])}.md"
+
+    if old_file == new_file:
+        return
+    if not old_file.exists():
+        log.warning("Cannot move %s — old file not found", old_file)
+        return
+
+    new_dir.mkdir(parents=True, exist_ok=True)
+    old_file.rename(new_file)
+    log.info("Moved %s → %s", old_file.relative_to(vault), new_file.relative_to(vault))
+
+    # Clean up empty parent directories
+    try:
+        old_dir.rmdir()  # only removes if empty
+    except OSError:
+        pass
+
+
 def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_files: list[str] | None = None) -> Path:
     """Write a markdown note with YAML frontmatter to the Obsidian vault inbox."""
     # Preserve reMarkable folder structure under Remarkable Notes/
@@ -754,18 +790,37 @@ def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_f
     safe_name = sanitize_filename(notebook["name"])
     filename = f"{safe_name}.md"
 
-    frontmatter = (
-        f'---\n'
-        f'title: "{notebook["name"]}"\n'
-        f'modified: {notebook["modified"]}\n'
-        f'source: reMarkable\n'
-        f'remarkable_id: "{notebook["id"]}"\n'
-        f'remarkable_path: "{rm_path}"\n'
-        f'tags:\n'
-        f'  - handwritten\n'
-        f'  - inbox\n'
-        f'---\n'
-    )
+    # Map reMarkable Type to a readable label
+    rm_type = notebook.get("type", "DocumentType")
+    type_label = "notebook" if rm_type == "DocumentType" else rm_type.lower()
+
+    lines = [
+        "---",
+        f'title: "{notebook["name"]}"',
+        f'modified: {notebook["modified"]}',
+        "source: reMarkable",
+        f'type: {type_label}',
+        f'remarkable_id: "{notebook["id"]}"',
+        f'remarkable_path: "{rm_path}"',
+    ]
+    if notebook.get("starred"):
+        lines.append("starred: true")
+    page_count = notebook.get("page_count")
+    if page_count is not None:
+        lines.append(f"page_count: {page_count}")
+
+    # Merge hardcoded tags with reMarkable tags
+    tags = ["handwritten", "inbox"]
+    for t in notebook.get("tags", []):
+        tag = t.strip().lower().replace(" ", "-")
+        if tag and tag not in tags:
+            tags.append(tag)
+    lines.append("tags:")
+    for tag in tags:
+        lines.append(f"  - {tag}")
+
+    lines.append("---")
+    frontmatter = "\n".join(lines) + "\n"
 
     body = "\n" + markdown + "\n"
 
@@ -802,7 +857,16 @@ def sync_notebooks(
         if not isinstance(nb_state, dict):
             nb_state = {}
 
+        # Detect path or name changes (notebook moved/renamed in reMarkable)
+        old_path = nb_state.get("path")
+        old_name = nb_state.get("name")
+        if old_path and (old_path != nb["path"] or old_name != nb["name"]):
+            _move_obsidian_note(vault_path, old_path, old_name or Path(old_path).name, nb)
+
         if nb_state.get("version") == nb["version"]:
+            # Update stored path/name even when skipping content sync
+            state[nb["id"]] = {**nb_state, "path": nb["path"], "name": nb["name"]}
+            save_state(state_file, state)
             log.info("Skipping %s (unchanged, version %s)", nb["name"], nb["version"])
             continue
 
@@ -823,9 +887,10 @@ def sync_notebooks(
                 markdown = transcribe_pdf(client, pdfs[0], model)
                 markdown, _ = extract_diagram_crops(markdown, pdfs, vault_path, nb["name"], client=client, model=model)
                 source_files = save_source_pages(vault_path, nb, pdfs)
+                nb["page_count"] = len(pdfs)
                 note_path = write_obsidian_note(vault_path, nb, markdown, source_files)
                 log.info("Wrote %s (%d chars)", note_path, len(markdown))
-                state[nb["id"]] = {"version": nb["version"]}
+                state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"]}
                 save_state(state_file, state)
                 continue
 
@@ -851,7 +916,7 @@ def sync_notebooks(
 
             if not changed_indices and not removed:
                 log.info("Skipping %s (no page content changed)", nb["name"])
-                state[nb["id"]] = {"version": nb["version"], "pages": cached_pages}
+                state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "pages": cached_pages}
                 save_state(state_file, state)
                 continue
 
@@ -889,6 +954,7 @@ def sync_notebooks(
             markdown, _ = extract_diagram_crops(markdown, svg_paths, vault_path, nb["name"], client=client, model=model)
 
             source_files = save_source_pages(vault_path, nb, svg_paths)
+            nb["page_count"] = len(rm_pages)
             note_path = write_obsidian_note(vault_path, nb, markdown, source_files)
             log.info("Wrote %s (%d chars, %d/%d pages transcribed)",
                      note_path, len(markdown), len(changed_indices), len(rm_pages))
@@ -900,7 +966,7 @@ def sync_notebooks(
                     "hash": page_hashes[str(i)],
                     "markdown": page_markdowns[str(i)],
                 }
-            state[nb["id"]] = {"version": nb["version"], "pages": new_pages}
+            state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "pages": new_pages}
             save_state(state_file, state)
         except Exception:
             log.error("Failed to process %s", nb["name"], exc_info=True)

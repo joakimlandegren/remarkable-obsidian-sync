@@ -16,6 +16,7 @@ from remarkable_to_obsidian import (
     _extract_rm_pages,
     _hash_file,
     _load_dotenv,
+    _move_obsidian_note,
     _svg_to_png,
     export_notebook,
     export_notebook_pdf,
@@ -283,10 +284,129 @@ def test_write_obsidian_note(tmp_path):
     assert 'remarkable_id: "abc-123"' in content
     assert "modified: 2025-01-15T10:30:00Z" in content
     assert "source: reMarkable" in content
+    assert "type: notebook" in content
     assert "- handwritten" in content
     assert "- inbox" in content
+    assert "starred:" not in content  # omitted when not starred
     assert content.endswith("- Discussed roadmap\n")
     assert "Remarkable Notes" in str(path.parent)
+
+
+def test_write_obsidian_note_starred(tmp_path):
+    """Starred notebooks get starred: true in frontmatter."""
+    vault = tmp_path / "vault"
+    notebook = {
+        "id": "abc-123",
+        "name": "Important",
+        "modified": "2025-01-15T10:30:00Z",
+        "starred": True,
+    }
+    path = write_obsidian_note(str(vault), notebook, "content")
+    content = path.read_text()
+    assert "starred: true" in content
+
+
+def test_write_obsidian_note_tags(tmp_path):
+    """reMarkable tags are merged into frontmatter tags."""
+    vault = tmp_path / "vault"
+    notebook = {
+        "id": "abc-123",
+        "name": "Tagged Note",
+        "modified": "2025-01-15T10:30:00Z",
+        "tags": ["Work", "Project Alpha"],
+    }
+    path = write_obsidian_note(str(vault), notebook, "content")
+    content = path.read_text()
+    assert "- handwritten" in content
+    assert "- inbox" in content
+    assert "- work" in content
+    assert "- project-alpha" in content
+
+
+def test_write_obsidian_note_page_count(tmp_path):
+    """Page count appears in frontmatter when set."""
+    vault = tmp_path / "vault"
+    notebook = {
+        "id": "abc-123",
+        "name": "Multi Page",
+        "modified": "2025-01-15T10:30:00Z",
+        "page_count": 5,
+    }
+    path = write_obsidian_note(str(vault), notebook, "content")
+    content = path.read_text()
+    assert "page_count: 5" in content
+
+
+def test_write_obsidian_note_type_mapping(tmp_path):
+    """DocumentType maps to 'notebook', others lowercase."""
+    vault = tmp_path / "vault"
+    nb_doc = {"id": "1", "name": "A", "modified": "2025-01-01", "type": "DocumentType"}
+    nb_epub = {"id": "2", "name": "B", "modified": "2025-01-01", "type": "epub"}
+
+    content_doc = write_obsidian_note(str(vault), nb_doc, "c").read_text()
+    content_epub = write_obsidian_note(str(vault), nb_epub, "c").read_text()
+    assert "type: notebook" in content_doc
+    assert "type: epub" in content_epub
+
+
+# --- Move/rename tests ---
+
+
+def test_move_obsidian_note_path_change(tmp_path):
+    """Moves note when notebook is moved to a different folder."""
+    vault = tmp_path / "vault"
+    old_dir = vault / "Remarkable Notes" / "Notes"
+    old_dir.mkdir(parents=True)
+    old_file = old_dir / "Meeting.md"
+    old_file.write_text("content")
+
+    notebook = {"name": "Meeting", "path": "/Archive/Meeting"}
+    _move_obsidian_note(str(vault), "/Notes/Meeting", "Meeting", notebook)
+
+    new_file = vault / "Remarkable Notes" / "Archive" / "Meeting.md"
+    assert new_file.exists()
+    assert not old_file.exists()
+    assert new_file.read_text() == "content"
+
+
+def test_move_obsidian_note_rename(tmp_path):
+    """Moves note when notebook is renamed."""
+    vault = tmp_path / "vault"
+    old_dir = vault / "Remarkable Notes" / "Notes"
+    old_dir.mkdir(parents=True)
+    old_file = old_dir / "Old Name.md"
+    old_file.write_text("content")
+
+    notebook = {"name": "New Name", "path": "/Notes/New Name"}
+    _move_obsidian_note(str(vault), "/Notes/Old Name", "Old Name", notebook)
+
+    new_file = vault / "Remarkable Notes" / "Notes" / "New Name.md"
+    assert new_file.exists()
+    assert not old_file.exists()
+
+
+def test_move_obsidian_note_missing_old(tmp_path):
+    """Gracefully handles missing old file."""
+    vault = tmp_path / "vault"
+    (vault / "Remarkable Notes").mkdir(parents=True)
+
+    notebook = {"name": "Note", "path": "/Archive/Note"}
+    # Should not raise — just logs a warning
+    _move_obsidian_note(str(vault), "/Notes/Note", "Note", notebook)
+
+
+def test_move_obsidian_note_cleans_empty_dir(tmp_path):
+    """Removes empty parent directory after move."""
+    vault = tmp_path / "vault"
+    old_dir = vault / "Remarkable Notes" / "OldFolder"
+    old_dir.mkdir(parents=True)
+    old_file = old_dir / "Note.md"
+    old_file.write_text("content")
+
+    notebook = {"name": "Note", "path": "/NewFolder/Note"}
+    _move_obsidian_note(str(vault), "/OldFolder/Note", "Note", notebook)
+
+    assert not old_dir.exists()  # empty dir removed
 
 
 # --- Sync orchestration tests ---
@@ -297,11 +417,37 @@ def test_sync_skips_unchanged(tmp_path, capsys):
     notebooks = [
         {"id": "abc-123", "name": "Old Notes", "version": 3, "modified": "2025-01-15T10:30:00Z", "path": "/Old Notes"},
     ]
-    state = {"abc-123": {"version": 3, "pages": {}}}  # Same version — should skip
+    state = {"abc-123": {"version": 3, "path": "/Old Notes", "name": "Old Notes", "pages": {}}}
 
-    with patch("remarkable_to_obsidian._extract_rm_pages") as mock_extract:
+    with patch("remarkable_to_obsidian._extract_rm_pages") as mock_extract, \
+         patch("remarkable_to_obsidian.save_state"):
         sync_notebooks(notebooks, state, "/tmp/vault", "rmapi", "claude-opus-4-6", dry_run=False, client=MagicMock(), state_file="/tmp/state.json")
         mock_extract.assert_not_called()
+
+
+def test_sync_moves_renamed_notebook(tmp_path):
+    """Moves Obsidian note when notebook path changes but version doesn't."""
+    vault = tmp_path / "vault"
+    old_dir = vault / "Remarkable Notes" / "Notes"
+    old_dir.mkdir(parents=True)
+    old_file = old_dir / "My Note.md"
+    old_file.write_text("---\ntitle: My Note\n---\ncontent")
+
+    notebooks = [
+        {"id": "abc-123", "name": "My Note", "version": 3, "modified": "2025-01-15T10:30:00Z", "path": "/Archive/My Note"},
+    ]
+    state = {"abc-123": {"version": 3, "path": "/Notes/My Note", "name": "My Note", "pages": {}}}
+
+    with patch("remarkable_to_obsidian._extract_rm_pages") as mock_extract, \
+         patch("remarkable_to_obsidian.save_state"):
+        sync_notebooks(notebooks, state, str(vault), "rmapi", "claude-opus-4-6", dry_run=False, client=MagicMock(), state_file="/tmp/state.json")
+        mock_extract.assert_not_called()  # version unchanged — no re-transcription
+
+    new_file = vault / "Remarkable Notes" / "Archive" / "My Note.md"
+    assert new_file.exists()
+    assert not old_file.exists()
+    # State should be updated with new path
+    assert state["abc-123"]["path"] == "/Archive/My Note"
 
 
 def test_sync_skips_unchanged_legacy_state(tmp_path, capsys):
@@ -339,7 +485,7 @@ def test_sync_processes_new_notebook(tmp_path):
 
     mock_extract.assert_called_once()
     mock_write.assert_called_once()
-    assert state["new-1"] == {"version": 1}
+    assert state["new-1"] == {"version": 1, "path": "/New Notes", "name": "New Notes"}
 
 
 def test_sync_incremental_pages(tmp_path):
