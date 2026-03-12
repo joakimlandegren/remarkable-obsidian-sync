@@ -1058,6 +1058,97 @@ def merge_state_files(target_file: str, source_files: list[str]) -> None:
     log.info("Merged %d state files into %s (%d notebooks)", len(source_files), target_file, len(merged))
 
 
+def retag_notebooks(notebooks: list[dict], vault_path: str, rmapi_bin: str) -> None:
+    """Download each notebook to extract tags from .content and update Obsidian frontmatter."""
+    vault = Path(vault_path)
+    base = vault / "Remarkable Notes"
+    updated = 0
+
+    for nb in notebooks:
+        safe_name = sanitize_filename(nb["name"])
+        rm_path = nb["path"]
+        parent = str(Path(rm_path).parent).lstrip("/")
+        note_dir = base / parent if parent and parent != "." else base
+        note_file = note_dir / f"{safe_name}.md"
+
+        if not note_file.exists():
+            continue
+
+        # Download notebook to temp dir
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            subprocess.run(
+                [rmapi_bin, "get", rm_path],
+                capture_output=True, text=True,
+                cwd=str(tmp_dir),
+            )
+            archives = list(tmp_dir.glob("*.zip")) + list(tmp_dir.glob("*.rmdoc"))
+            if not archives:
+                continue
+
+            _extract_content_tags(archives[0], rm_path)
+            content_tags = _content_tags.pop(rm_path, [])
+            if not content_tags:
+                continue
+
+            # Read existing note and update frontmatter tags
+            text = note_file.read_text()
+            if "---" not in text:
+                continue
+
+            parts = text.split("---", 2)
+            if len(parts) < 3:
+                continue
+
+            frontmatter = parts[1]
+
+            # Parse existing tags from frontmatter
+            existing_tags: list[str] = []
+            fm_lines = frontmatter.split("\n")
+            in_tags = False
+            tag_start = -1
+            tag_end = -1
+            for i, line in enumerate(fm_lines):
+                if line.strip() == "tags:":
+                    in_tags = True
+                    tag_start = i
+                    continue
+                if in_tags:
+                    if line.strip().startswith("- "):
+                        existing_tags.append(line.strip().removeprefix("- ").strip())
+                        tag_end = i
+                    else:
+                        break
+
+            # Merge new tags
+            merged = list(existing_tags)
+            for t in content_tags:
+                tag = t.strip().lower().replace(" ", "-")
+                if tag and tag not in merged:
+                    merged.append(tag)
+
+            if merged == existing_tags:
+                continue  # no new tags
+
+            # Rebuild frontmatter with updated tags
+            new_tag_lines = ["tags:"] + [f"  - {t}" for t in merged]
+            if tag_start >= 0 and tag_end >= 0:
+                fm_lines[tag_start:tag_end + 1] = new_tag_lines
+            else:
+                # No tags section — add before closing ---
+                fm_lines.extend(new_tag_lines)
+
+            new_frontmatter = "\n".join(fm_lines)
+            note_file.write_text(f"---{new_frontmatter}---{parts[2]}")
+            updated += 1
+            log.info("Updated tags for %s: %s", nb["name"], merged)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    log.info("Retag complete: %d notes updated", updated)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync reMarkable notebooks to Obsidian")
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing files")
@@ -1065,6 +1156,7 @@ def main():
     parser.add_argument("--notebooks-json", metavar="FILE", help="Read notebook list from JSON instead of rmapi")
     parser.add_argument("--slice", metavar="START:END", help="Process only notebooks[START:END]")
     parser.add_argument("--merge-states", nargs="+", metavar="FILE", help="Merge state files into main state and exit")
+    parser.add_argument("--retag", action="store_true", help="Re-download notebooks to sync tags without re-transcribing")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1112,6 +1204,11 @@ def main():
         end = int(end) if end else len(notebooks)
         notebooks = notebooks[start:end]
         log.info("Processing slice [%d:%d] (%d notebooks)", start, end, len(notebooks))
+
+    # Retag mode: download notebooks for tag extraction only, no transcription
+    if args.retag:
+        retag_notebooks(notebooks, config["obsidian_vault"], config["rmapi_bin"])
+        return
 
     client = None
     if not args.dry_run:
