@@ -12,6 +12,8 @@ import pytest
 
 from remarkable_to_obsidian import (
     DIAGRAM_RE,
+    SyncResult,
+    SyncSummary,
     _encode_page_image,
     _content_tags,
     _extract_content_tags,
@@ -21,6 +23,8 @@ from remarkable_to_obsidian import (
     _move_obsidian_note,
     _move_obsidian_note_legacy,
     _svg_to_png,
+    autolink_markdown,
+    build_note_index,
     export_notebook,
     export_notebook_pdf,
     extract_diagram_crops,
@@ -39,6 +43,7 @@ from remarkable_to_obsidian import (
     transcribe_pages,
     transcribe_pdf,
     write_obsidian_note,
+    write_sync_log,
 )
 
 
@@ -1300,3 +1305,229 @@ def test_retag_handles_subfolder_path(tmp_path):
     content = note_file.read_text()
     assert "- handwritten" in content
     assert "- weekly" in content
+
+
+# --- Sync log tests ---
+
+
+def test_write_sync_log_new_file(tmp_path):
+    """Creates a new sync log when none exists."""
+    vault = tmp_path / "vault"
+    summary = SyncSummary(results=[
+        SyncResult("Journal", "/Spotify/Journal", "synced", "3/3 pages transcribed"),
+        SyncResult("Old Notes", "/Old Notes", "skipped", "unchanged"),
+    ])
+
+    log_path = write_sync_log(str(vault), summary)
+
+    assert log_path.exists()
+    content = log_path.read_text()
+    assert "## Sync -" in content
+    assert "1 synced, 1 skipped, 0 errors" in content
+    assert "### Synced" in content
+    assert "Journal" in content
+
+
+def test_write_sync_log_prepends(tmp_path):
+    """Prepends new entry to existing log."""
+    vault = tmp_path / "vault"
+    log_dir = vault / "Remarkable Notes"
+    log_dir.mkdir(parents=True)
+    log_file = log_dir / "Sync Log.md"
+    log_file.write_text("## Sync - 2026-03-01 10:00\n\n0 synced, 5 skipped, 0 errors\n")
+
+    summary = SyncSummary(results=[
+        SyncResult("New Note", "/New Note", "synced", "2/2 pages transcribed"),
+    ])
+
+    write_sync_log(str(vault), summary)
+
+    content = log_file.read_text()
+    entries = [line for line in content.split("\n") if line.startswith("## Sync -")]
+    assert len(entries) == 2
+    # New entry should be first
+    assert content.index("1 synced") < content.index("0 synced")
+
+
+def test_write_sync_log_rolling_limit(tmp_path):
+    """Caps entries at 10."""
+    vault = tmp_path / "vault"
+    log_dir = vault / "Remarkable Notes"
+    log_dir.mkdir(parents=True)
+    log_file = log_dir / "Sync Log.md"
+
+    # Write 12 existing entries
+    entries = []
+    for i in range(12):
+        entries.append(f"## Sync - 2026-03-{i+1:02d} 10:00\n\n0 synced, {i} skipped, 0 errors")
+    log_file.write_text("\n\n".join(entries) + "\n")
+
+    summary = SyncSummary(results=[SyncResult("X", "/X", "skipped", "unchanged")])
+    write_sync_log(str(vault), summary)
+
+    content = log_file.read_text()
+    heading_count = len([line for line in content.split("\n") if line.startswith("## Sync -")])
+    assert heading_count == 10
+
+
+def test_write_sync_log_wiki_links(tmp_path):
+    """Generates correct wiki links with subfolder paths."""
+    vault = tmp_path / "vault"
+    summary = SyncSummary(results=[
+        SyncResult("FinE leads", "/Spotify/Journal/FinE leads", "synced", "3/3 pages transcribed"),
+    ])
+
+    log_path = write_sync_log(str(vault), summary)
+
+    content = log_path.read_text()
+    assert "[[Remarkable Notes/Spotify/Journal/FinE leads|FinE leads]]" in content
+
+
+def test_sync_returns_summary(tmp_path):
+    """sync_notebooks returns SyncSummary with correct action counts."""
+    notebooks = [
+        {"id": "nb-1", "name": "Unchanged", "version": 3, "modified": "2025-01-15", "path": "/Unchanged"},
+        {"id": "nb-2", "name": "New", "version": 1, "modified": "2025-01-20", "path": "/New"},
+    ]
+    state = {"nb-1": {"version": 3, "path": "/Unchanged", "name": "Unchanged", "pages": {}}}
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="# Content")]
+    mock_client.messages.create.return_value = mock_response
+
+    fake_pdf = tmp_path / "New.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4")
+
+    with patch("remarkable_to_obsidian._extract_rm_pages", return_value=None), \
+         patch("remarkable_to_obsidian.write_obsidian_note"), \
+         patch("remarkable_to_obsidian.save_state"), \
+         patch("tempfile.mkdtemp", return_value=str(tmp_path)):
+        result = sync_notebooks(
+            notebooks, state, str(tmp_path / "vault"), "rmapi", "claude-opus-4-6",
+            dry_run=False, client=mock_client, state_file="/tmp/state.json",
+        )
+
+    assert isinstance(result, SyncSummary)
+    assert len(result.skipped) == 1
+    assert len(result.synced) == 1
+    assert result.skipped[0].name == "Unchanged"
+    assert result.synced[0].name == "New"
+
+
+# --- Auto-linking tests ---
+
+
+def test_build_note_index_basic(tmp_path):
+    """Builds index from .md files with correct stem extraction."""
+    (tmp_path / "Meeting Notes.md").write_text("content")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "Deep Note.md").write_text("content")
+
+    index = build_note_index(str(tmp_path))
+
+    assert "meeting notes" in index
+    assert index["meeting notes"] == "Meeting Notes"
+    assert "deep note" in index
+    assert index["deep note"] == "Deep Note"
+
+
+def test_build_note_index_min_length(tmp_path):
+    """Excludes names shorter than 4 characters."""
+    (tmp_path / "OK.md").write_text("content")
+    (tmp_path / "A.md").write_text("content")
+    (tmp_path / "Long Enough.md").write_text("content")
+
+    index = build_note_index(str(tmp_path))
+
+    assert "ok" not in index
+    assert "a" not in index
+    assert "long enough" in index
+
+
+def test_build_note_index_excludes_dates(tmp_path):
+    """Excludes YYYY-MM-DD daily note patterns."""
+    (tmp_path / "2026-03-12.md").write_text("content")
+    (tmp_path / "2024-01-01.md").write_text("content")
+    (tmp_path / "Regular Note.md").write_text("content")
+
+    index = build_note_index(str(tmp_path))
+
+    assert "2026-03-12" not in index
+    assert "2024-01-01" not in index
+    assert "regular note" in index
+
+
+def test_autolink_simple_match():
+    """Wraps known note name in wiki link."""
+    index = {"meeting notes": "Meeting Notes"}
+    text = "Discussed in Meeting Notes today"
+    result = autolink_markdown(text, index)
+    assert result == "Discussed in [[Meeting Notes]] today"
+
+
+def test_autolink_case_insensitive():
+    """Uses display text for case mismatch."""
+    index = {"meeting notes": "Meeting Notes"}
+    text = "See meeting notes for details"
+    result = autolink_markdown(text, index)
+    assert result == "See [[Meeting Notes|meeting notes]] for details"
+
+
+def test_autolink_whole_word_only():
+    """Does not match partial words."""
+    index = {"note": "Note"}
+    # "note" is < 4 chars but we test autolink directly with a custom index
+    text = "This is a notebook and a note"
+    result = autolink_markdown(text, index)
+    assert "[[Note|notebook" not in result
+    assert "[[Note|note]]" in result or "[[Note]]" in result
+
+
+def test_autolink_preserves_existing_links():
+    """Does not double-link existing wiki links."""
+    index = {"meeting notes": "Meeting Notes"}
+    text = "See [[Meeting Notes]] and Meeting Notes"
+    result = autolink_markdown(text, index)
+    # The first occurrence is already linked, should stay as-is
+    assert result.count("[[Meeting Notes]]") == 2
+
+
+def test_autolink_preserves_code_blocks():
+    """Skips matches inside fenced code blocks."""
+    index = {"meeting notes": "Meeting Notes"}
+    text = "```\nMeeting Notes inside code\n```\n\nMeeting Notes outside"
+    result = autolink_markdown(text, index)
+    assert "```\nMeeting Notes inside code\n```" in result
+    assert "[[Meeting Notes]]" in result
+
+
+def test_autolink_preserves_frontmatter():
+    """Skips matches inside YAML frontmatter."""
+    index = {"meeting notes": "Meeting Notes"}
+    text = "---\ntitle: Meeting Notes\n---\n\nMeeting Notes in body"
+    result = autolink_markdown(text, index)
+    assert '---\ntitle: Meeting Notes\n---' in result
+    assert "[[Meeting Notes]]" in result
+
+
+def test_autolink_longest_match_first():
+    """Matches longer names before shorter ones."""
+    index = {
+        "sergio": "Sergio",
+        "sergio lopez montolio": "Sergio Lopez Montolio",
+    }
+    text = "Discussed with Sergio Lopez Montolio and Sergio"
+    result = autolink_markdown(text, index)
+    assert "[[Sergio Lopez Montolio]]" in result
+    assert "[[Sergio]]" in result
+    # Should not have nested links
+    assert "[[Sergio Lopez Montolio|[[Sergio" not in result
+
+
+def test_autolink_no_matches():
+    """Returns unchanged text when no names match."""
+    index = {"meeting notes": "Meeting Notes"}
+    text = "Nothing to link here"
+    result = autolink_markdown(text, index)
+    assert result == "Nothing to link here"

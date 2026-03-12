@@ -15,9 +15,42 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from rmscene import read_blocks, SceneLineItemBlock
+
+
+@dataclass
+class SyncResult:
+    """Outcome for a single notebook sync attempt."""
+    name: str
+    path: str
+    action: str  # "synced", "skipped", "errored", "dry_run"
+    detail: str = ""
+
+
+@dataclass
+class SyncSummary:
+    """Collects results from a full sync run."""
+    results: list[SyncResult] = field(default_factory=list)
+
+    @property
+    def synced(self) -> list[SyncResult]:
+        return [r for r in self.results if r.action == "synced"]
+
+    @property
+    def skipped(self) -> list[SyncResult]:
+        return [r for r in self.results if r.action == "skipped"]
+
+    @property
+    def errored(self) -> list[SyncResult]:
+        return [r for r in self.results if r.action == "errored"]
+
+    @property
+    def dry_runs(self) -> list[SyncResult]:
+        return [r for r in self.results if r.action == "dry_run"]
 
 
 def _load_dotenv():
@@ -910,8 +943,10 @@ def sync_notebooks(
     dry_run: bool,
     client,
     state_file: str,
-) -> None:
+    note_index: dict[str, str] | None = None,
+) -> SyncSummary:
     """Process each notebook: skip unchanged, export, transcribe changed pages, write."""
+    summary = SyncSummary()
     for nb in notebooks:
         nb_state = state.get(nb["id"], {})
 
@@ -936,6 +971,7 @@ def sync_notebooks(
             state[nb["id"]] = {**nb_state, "path": nb["path"], "name": nb["name"]}
             save_state(state_file, state)
             log.info("Skipping %s (unchanged, version %s)", nb["name"], nb["version"])
+            summary.results.append(SyncResult(nb["name"], nb["path"], "skipped", "unchanged"))
             continue
 
         log.info("Processing: %s", nb["name"])
@@ -957,15 +993,19 @@ def sync_notebooks(
                     continue
                 if dry_run:
                     log.info("[DRY RUN] Would transcribe %s (PDF, %d bytes)", nb["name"], pdfs[0].stat().st_size)
+                    summary.results.append(SyncResult(nb["name"], nb["path"], "dry_run", "PDF"))
                     continue
                 markdown = transcribe_pdf(client, pdfs[0], model)
                 markdown, _ = extract_diagram_crops(markdown, pdfs, vault_path, nb["name"], client=client, model=model)
+                if note_index:
+                    markdown = autolink_markdown(markdown, note_index)
                 source_files = save_source_pages(vault_path, nb, pdfs)
                 nb["page_count"] = len(pdfs)
                 note_path = write_obsidian_note(vault_path, nb, markdown, source_files)
                 log.info("Wrote %s (%d chars)", note_path, len(markdown))
                 state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"]}
                 save_state(state_file, state)
+                summary.results.append(SyncResult(nb["name"], nb["path"], "synced", f"{len(pdfs)} PDF pages"))
                 continue
 
             if not rm_pages:
@@ -992,11 +1032,13 @@ def sync_notebooks(
                 log.info("Skipping %s (no page content changed)", nb["name"])
                 state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "pages": cached_pages}
                 save_state(state_file, state)
+                summary.results.append(SyncResult(nb["name"], nb["path"], "skipped", "no page content changed"))
                 continue
 
             if dry_run:
                 log.info("[DRY RUN] Would transcribe %d/%d changed pages in %s",
                          len(changed_indices), len(rm_pages), nb["name"])
+                summary.results.append(SyncResult(nb["name"], nb["path"], "dry_run", f"{len(changed_indices)}/{len(rm_pages)} pages changed"))
                 continue
 
             # Render all pages to SVG (needed for source images)
@@ -1027,11 +1069,15 @@ def sync_notebooks(
             # Extract and crop any diagram regions
             markdown, _ = extract_diagram_crops(markdown, svg_paths, vault_path, nb["name"], client=client, model=model)
 
+            if note_index:
+                markdown = autolink_markdown(markdown, note_index)
+
             source_files = save_source_pages(vault_path, nb, svg_paths)
             nb["page_count"] = len(rm_pages)
             note_path = write_obsidian_note(vault_path, nb, markdown, source_files)
             log.info("Wrote %s (%d chars, %d/%d pages transcribed)",
                      note_path, len(markdown), len(changed_indices), len(rm_pages))
+            summary.results.append(SyncResult(nb["name"], nb["path"], "synced", f"{len(changed_indices)}/{len(rm_pages)} pages transcribed"))
 
             # Save per-page state
             new_pages = {}
@@ -1042,10 +1088,13 @@ def sync_notebooks(
                 }
             state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "pages": new_pages}
             save_state(state_file, state)
-        except Exception:
+        except Exception as exc:
             log.error("Failed to process %s", nb["name"], exc_info=True)
+            summary.results.append(SyncResult(nb["name"], nb["path"], "errored", str(exc)))
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return summary
 
 
 def merge_state_files(target_file: str, source_files: list[str]) -> None:
@@ -1149,6 +1198,146 @@ def retag_notebooks(notebooks: list[dict], vault_path: str, rmapi_bin: str) -> N
     log.info("Retag complete: %d notes updated", updated)
 
 
+def write_sync_log(vault_path: str, summary: SyncSummary) -> Path:
+    """Write/update a rolling sync log in the vault (newest first, max 10 entries)."""
+    log_dir = Path(vault_path) / "Remarkable Notes"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "Sync Log.md"
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [f"## Sync - {now}", ""]
+    lines.append(f"{len(summary.synced)} synced, {len(summary.skipped)} skipped, {len(summary.errored)} errors")
+    lines.append("")
+
+    if summary.synced:
+        lines.append("### Synced")
+        for r in summary.synced:
+            # Build wiki link from the reMarkable path
+            rm_parent = str(Path(r.path).parent).lstrip("/")
+            if rm_parent and rm_parent != ".":
+                link_path = f"Remarkable Notes/{rm_parent}/{sanitize_filename(r.name)}"
+            else:
+                link_path = f"Remarkable Notes/{sanitize_filename(r.name)}"
+            lines.append(f"- [[{link_path}|{r.name}]] - {r.detail}")
+        lines.append("")
+
+    if summary.errored:
+        lines.append("### Errors")
+        for r in summary.errored:
+            lines.append(f"- {r.name} - {r.detail}")
+        lines.append("")
+
+    new_entry = "\n".join(lines)
+
+    # Parse existing entries and prepend
+    existing_entries: list[str] = []
+    if log_file.exists():
+        content = log_file.read_text()
+        # Split on ## Sync - headings
+        parts = re.split(r"(?=^## Sync - )", content, flags=re.MULTILINE)
+        for part in parts:
+            part = part.strip()
+            if part.startswith("## Sync -"):
+                existing_entries.append(part)
+
+    # Rolling limit: keep newest 9 existing + 1 new = 10 total
+    all_entries = [new_entry.strip()] + existing_entries[:9]
+    full_content = "\n\n".join(all_entries) + "\n"
+    log_file.write_text(full_content)
+    return log_file
+
+
+_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def build_note_index(vault_path: str) -> dict[str, str]:
+    """Scan vault for .md files and return {lowercase_stem: actual_stem} mapping."""
+    index: dict[str, str] = {}
+    vault = Path(vault_path)
+    for md_file in vault.rglob("*.md"):
+        stem = md_file.stem
+        # Exclude short names (< 4 chars) to avoid false positives
+        if len(stem) < 4:
+            continue
+        # Exclude date-pattern daily notes
+        if _DATE_PATTERN.match(stem):
+            continue
+        # Exclude numeric-only names
+        if stem.isdigit():
+            continue
+        index[stem.lower()] = stem
+    return index
+
+
+def autolink_markdown(text: str, note_index: dict[str, str]) -> str:
+    """Insert wiki links for known vault note names, preserving protected regions."""
+    if not note_index:
+        return text
+
+    # Phase 1: Find protected regions (byte offsets of regions to skip)
+    protected: list[tuple[int, int]] = []
+
+    # Frontmatter (--- ... ---)
+    fm_match = re.match(r"^---\n.*?\n---\n", text, re.DOTALL)
+    if fm_match:
+        protected.append((fm_match.start(), fm_match.end()))
+
+    # Existing wiki links [[...]]
+    for m in re.finditer(r"\[\[.*?\]\]", text):
+        protected.append((m.start(), m.end()))
+
+    # Embeds ![[...]]
+    for m in re.finditer(r"!\[\[.*?\]\]", text):
+        protected.append((m.start(), m.end()))
+
+    # Inline code `...`
+    for m in re.finditer(r"`[^`]+`", text):
+        protected.append((m.start(), m.end()))
+
+    # Fenced code blocks ```...```
+    for m in re.finditer(r"```.*?```", text, re.DOTALL):
+        protected.append((m.start(), m.end()))
+
+    def is_protected(start: int, end: int) -> bool:
+        for ps, pe in protected:
+            if start < pe and end > ps:
+                return True
+        return False
+
+    # Phase 2: Sort note names longest-first to prevent partial matches
+    sorted_names = sorted(note_index.items(), key=lambda x: len(x[1]), reverse=True)
+
+    for lower_name, actual_name in sorted_names:
+        # Build regex with word boundaries
+        pattern = re.compile(r"\b" + re.escape(actual_name) + r"\b", re.IGNORECASE)
+        # Process from end to start to preserve offsets
+        matches = list(pattern.finditer(text))
+        for m in reversed(matches):
+            if is_protected(m.start(), m.end()):
+                continue
+            matched_text = m.group(0)
+            if matched_text == actual_name:
+                replacement = f"[[{actual_name}]]"
+            else:
+                replacement = f"[[{actual_name}|{matched_text}]]"
+            text = text[:m.start()] + replacement + text[m.end():]
+            # Update protected regions: shift all after this point
+            shift = len(replacement) - len(matched_text)
+            protected_new = []
+            for ps, pe in protected:
+                if ps >= m.end():
+                    protected_new.append((ps + shift, pe + shift))
+                elif pe <= m.start():
+                    protected_new.append((ps, pe))
+                else:
+                    protected_new.append((ps, pe))
+            # Also protect the new link itself
+            protected_new.append((m.start(), m.start() + len(replacement)))
+            protected = protected_new
+
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync reMarkable notebooks to Obsidian")
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing files")
@@ -1157,6 +1346,7 @@ def main():
     parser.add_argument("--slice", metavar="START:END", help="Process only notebooks[START:END]")
     parser.add_argument("--merge-states", nargs="+", metavar="FILE", help="Merge state files into main state and exit")
     parser.add_argument("--retag", action="store_true", help="Re-download notebooks to sync tags without re-transcribing")
+    parser.add_argument("--no-autolink", action="store_true", help="Disable auto-linking of vault note names in transcriptions")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1225,12 +1415,26 @@ def main():
             )
         else:
             client = anthropic.Anthropic()
-    sync_notebooks(
+
+    # Build note index for auto-linking (unless disabled)
+    note_index = None
+    if not args.no_autolink:
+        note_index = build_note_index(config["obsidian_vault"])
+        log.info("Built note index: %d entries", len(note_index))
+
+    summary = sync_notebooks(
         notebooks, state, config["obsidian_vault"], config["rmapi_bin"],
         config["model"], args.dry_run, client, config["state_file"],
+        note_index=note_index,
     )
 
-    log.info("Sync complete.")
+    # Write sync log (skip for dry-run or empty results)
+    if not args.dry_run and summary.results:
+        log_path = write_sync_log(config["obsidian_vault"], summary)
+        log.info("Wrote sync log: %s", log_path)
+
+    log.info("Sync complete: %d synced, %d skipped, %d errors",
+             len(summary.synced), len(summary.skipped), len(summary.errored))
 
 
 if __name__ == "__main__":
