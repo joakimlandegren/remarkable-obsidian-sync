@@ -928,8 +928,11 @@ def sync_notebooks(
             # Legacy state without stored path — search for existing note by name
             _move_obsidian_note_legacy(vault_path, nb)
 
-        if nb_state.get("version") == nb["version"]:
-            # Update stored path/name even when skipping content sync
+        if nb_state.get("version") == nb["version"] and nb["version"] != 0:
+            # Update stored path/name even when skipping content sync.
+            # Skip the fast-path when version is 0 - the reMarkable API
+            # sometimes never increments from 0, so we fall through to
+            # page-level hash comparison to detect actual content changes.
             state[nb["id"]] = {**nb_state, "path": nb["path"], "name": nb["name"]}
             save_state(state_file, state)
             log.info("Skipping %s (unchanged, version %s)", nb["name"], nb["version"])
