@@ -30,6 +30,7 @@ from remarkable_to_obsidian import (
     load_ignore_patterns,
     load_state,
     merge_state_files,
+    retag_notebooks,
     sanitize_filename,
     save_source_pages,
     save_state,
@@ -1142,3 +1143,160 @@ def test_write_obsidian_note_with_sources(tmp_path):
     assert "## Handwritten source" in content
     assert "![[Notes - page 1.png]]" in content
     assert "![[Notes - page 2.png]]" in content
+
+
+# --- Retag notebooks tests ---
+
+
+def _make_rmdoc_with_tags(path, tags):
+    """Helper: create an .rmdoc zip with pageTags in .content."""
+    content_data = json.dumps({
+        "pageTags": [{"name": t, "pageId": f"page-{i}", "timestamp": i} for i, t in enumerate(tags)],
+        "tags": [],
+    })
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("abc-123.content", content_data)
+
+
+def _make_note_with_frontmatter(note_file, frontmatter_body, body="# Content"):
+    """Helper: create a markdown note with frontmatter."""
+    note_file.parent.mkdir(parents=True, exist_ok=True)
+    note_file.write_text(f"---\n{frontmatter_body}\n---\n{body}")
+
+
+def test_retag_adds_new_tags(tmp_path):
+    """Retag adds tags from .content to frontmatter."""
+    vault = tmp_path / "vault"
+    note_file = vault / "Remarkable Notes" / "FinE leads.md"
+    _make_note_with_frontmatter(note_file, "title: FinE leads\ntags:\n  - handwritten\n  - inbox")
+
+    notebooks = [{"id": "abc", "name": "FinE leads", "path": "/FinE leads"}]
+
+    def mock_run(cmd, **kwargs):
+        cwd = Path(kwargs.get("cwd", "."))
+        _make_rmdoc_with_tags(cwd / "notebook.rmdoc", ["strategy", "important"])
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        retag_notebooks(notebooks, str(vault), "rmapi")
+
+    content = note_file.read_text()
+    assert "- handwritten" in content
+    assert "- inbox" in content
+    assert "- strategy" in content
+    assert "- important" in content
+
+
+def test_retag_skips_duplicate_tags(tmp_path):
+    """Retag does not duplicate tags already in frontmatter."""
+    vault = tmp_path / "vault"
+    note_file = vault / "Remarkable Notes" / "Notes.md"
+    _make_note_with_frontmatter(note_file, "title: Notes\ntags:\n  - handwritten\n  - strategy")
+
+    notebooks = [{"id": "abc", "name": "Notes", "path": "/Notes"}]
+
+    def mock_run(cmd, **kwargs):
+        cwd = Path(kwargs.get("cwd", "."))
+        _make_rmdoc_with_tags(cwd / "notebook.rmdoc", ["strategy"])
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        retag_notebooks(notebooks, str(vault), "rmapi")
+
+    content = note_file.read_text()
+    # Should appear exactly once
+    assert content.count("strategy") == 1
+
+
+def test_retag_skips_missing_note(tmp_path):
+    """Retag skips notebooks without a corresponding Obsidian note."""
+    vault = tmp_path / "vault"
+    (vault / "Remarkable Notes").mkdir(parents=True)
+    # No note file created
+
+    notebooks = [{"id": "abc", "name": "Missing", "path": "/Missing"}]
+
+    with patch("subprocess.run") as mock_run:
+        retag_notebooks(notebooks, str(vault), "rmapi")
+        mock_run.assert_not_called()
+
+
+def test_retag_skips_no_tags(tmp_path):
+    """Retag does not modify note when .content has no tags."""
+    vault = tmp_path / "vault"
+    note_file = vault / "Remarkable Notes" / "Empty.md"
+    original = "---\ntitle: Empty\ntags:\n  - handwritten\n---\n# Content"
+    _make_note_with_frontmatter(note_file, "title: Empty\ntags:\n  - handwritten")
+
+    notebooks = [{"id": "abc", "name": "Empty", "path": "/Empty"}]
+
+    def mock_run(cmd, **kwargs):
+        cwd = Path(kwargs.get("cwd", "."))
+        _make_rmdoc_with_tags(cwd / "notebook.rmdoc", [])
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        retag_notebooks(notebooks, str(vault), "rmapi")
+
+    assert note_file.read_text() == original
+
+
+def test_retag_skips_no_archive(tmp_path):
+    """Retag skips when rmapi download produces no archive."""
+    vault = tmp_path / "vault"
+    note_file = vault / "Remarkable Notes" / "Notes.md"
+    original = "---\ntitle: Notes\n---\n# Content"
+    _make_note_with_frontmatter(note_file, "title: Notes")
+
+    notebooks = [{"id": "abc", "name": "Notes", "path": "/Notes"}]
+
+    def mock_run(cmd, **kwargs):
+        # Don't create any archive file
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        retag_notebooks(notebooks, str(vault), "rmapi")
+
+    assert note_file.read_text() == original
+
+
+def test_retag_adds_tags_section_when_missing(tmp_path):
+    """Retag adds a tags section when frontmatter has none."""
+    vault = tmp_path / "vault"
+    note_file = vault / "Remarkable Notes" / "Notes.md"
+    _make_note_with_frontmatter(note_file, "title: Notes")
+
+    notebooks = [{"id": "abc", "name": "Notes", "path": "/Notes"}]
+
+    def mock_run(cmd, **kwargs):
+        cwd = Path(kwargs.get("cwd", "."))
+        _make_rmdoc_with_tags(cwd / "notebook.rmdoc", ["meeting"])
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        retag_notebooks(notebooks, str(vault), "rmapi")
+
+    content = note_file.read_text()
+    assert "tags:" in content
+    assert "- meeting" in content
+
+
+def test_retag_handles_subfolder_path(tmp_path):
+    """Retag resolves notebook path to correct vault subfolder."""
+    vault = tmp_path / "vault"
+    note_file = vault / "Remarkable Notes" / "Spotify" / "Journal" / "FinE leads.md"
+    _make_note_with_frontmatter(note_file, "title: FinE leads\ntags:\n  - handwritten")
+
+    notebooks = [{"id": "abc", "name": "FinE leads", "path": "/Spotify/Journal/FinE leads"}]
+
+    def mock_run(cmd, **kwargs):
+        cwd = Path(kwargs.get("cwd", "."))
+        _make_rmdoc_with_tags(cwd / "notebook.rmdoc", ["weekly"])
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        retag_notebooks(notebooks, str(vault), "rmapi")
+
+    content = note_file.read_text()
+    assert "- handwritten" in content
+    assert "- weekly" in content
