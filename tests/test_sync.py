@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -12,9 +13,15 @@ import pytest
 
 from remarkable_to_obsidian import (
     DIAGRAM_RE,
+    SINGLE_PAGE_PROMPT,
+    TASK_EXTRACTION_PROMPT,
+    TAG_INFERENCE_PROMPT,
+    TRANSCRIPTION_PROMPT,
     SyncResult,
     SyncSummary,
+    _build_page_context,
     _encode_page_image,
+    _inject_tasks,
     _content_tags,
     _extract_content_tags,
     _extract_rm_pages,
@@ -23,17 +30,22 @@ from remarkable_to_obsidian import (
     _move_obsidian_note,
     _move_obsidian_note_legacy,
     _svg_to_png,
+    _validate_mermaid,
     autolink_markdown,
     build_note_index,
     export_notebook,
     export_notebook_pdf,
     extract_diagram_crops,
+    extract_tasks,
+    infer_tags,
+    is_blank_page,
     is_ignored,
     list_notebooks,
     load_config,
     load_ignore_patterns,
     load_state,
     merge_state_files,
+    resolve_prompt,
     retag_notebooks,
     sanitize_filename,
     save_source_pages,
@@ -256,6 +268,10 @@ def test_transcribe_pdf(tmp_path):
     call_args = mock_client.messages.create.call_args
     assert call_args.kwargs["model"] == "claude-opus-4-6"
     assert call_args.kwargs["max_tokens"] == 16384
+    # D2: system parameter with cache_control
+    system = call_args.kwargs["system"]
+    assert len(system) == 1
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
     messages = call_args.kwargs["messages"]
     assert len(messages) == 1
     content = messages[0]["content"]
@@ -578,7 +594,7 @@ def test_sync_incremental_pages(tmp_path):
     mock_client.messages.create.return_value = mock_response
 
     with patch("remarkable_to_obsidian._extract_rm_pages", return_value=[rm1, rm2]), \
-         patch("remarkable_to_obsidian._render_rm_to_svg", return_value='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1404 1872" width="1404" height="1872"><rect width="100%" height="100%" fill="white"/></svg>'), \
+         patch("remarkable_to_obsidian._render_rm_to_svg", return_value='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1404 1872" width="1404" height="1872"><rect width="100%" height="100%" fill="white"/><path d="M 100 100 L 200 200" stroke="black"/></svg>'), \
          patch("remarkable_to_obsidian.save_source_pages", return_value=[]), \
          patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
          patch("remarkable_to_obsidian.save_state"), \
@@ -838,10 +854,15 @@ def test_transcribe_page(tmp_path):
 
     assert result == "# Page content"
     call_args = mock_client.messages.create.call_args
+    # D2: system parameter with cache_control
+    system = call_args.kwargs["system"]
+    assert len(system) == 1
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
     content = call_args.kwargs["messages"][0]["content"]
     assert content[0]["type"] == "image"
     assert content[0]["source"]["media_type"] == "image/png"
-    assert content[1]["type"] == "text"
+    # Prompt moved to system, only image in user content (no context)
+    assert len(content) == 1
 
 
 def test_transcribe_pages_multiple(tmp_path):
@@ -860,12 +881,15 @@ def test_transcribe_pages_multiple(tmp_path):
 
     assert result == "# Page 1\n\n# Page 2"
     call_args = mock_client.messages.create.call_args
+    # D2: system parameter with cache_control
+    system = call_args.kwargs["system"]
+    assert len(system) == 1
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
     content = call_args.kwargs["messages"][0]["content"]
-    # 2 images + 1 text prompt
-    assert len(content) == 3
+    # 2 images only (prompt moved to system)
+    assert len(content) == 2
     assert content[0]["type"] == "image"
     assert content[1]["type"] == "image"
-    assert content[2]["type"] == "text"
 
 
 # --- Diagram extraction tests ---
@@ -919,6 +943,33 @@ def test_extract_diagram_crops_success(tmp_path):
     # Verify crop file was saved
     crop_path = tmp_path / "Attachments" / "reMarkable" / "Test - diagram 1.png"
     assert crop_path.exists()
+
+
+def test_extract_diagram_crops_pdf_page(tmp_path):
+    """Renders PDF page to image for cropping."""
+    markdown = '> [Diagram(page=1, top=20, bottom=60): a receipt table]'
+
+    # Create a real single-page PDF using PyMuPDF
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((100, 400), "Receipt item: $42.00", fontsize=14)
+    pdf_path = tmp_path / "original.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+
+    result, crops = extract_diagram_crops(markdown, [pdf_path], str(tmp_path), "Receipt")
+
+    assert "![[Receipt - diagram 1.png]]" in result
+    assert "> *a receipt table*" in result
+    assert len(crops) == 1
+    crop_path = tmp_path / "Attachments" / "reMarkable" / "Receipt - diagram 1.png"
+    assert crop_path.exists()
+    # Verify it's a valid PNG
+    from PIL import Image
+    img = Image.open(crop_path)
+    assert img.width > 0
+    assert img.height > 0
 
 
 # --- Save source pages tests ---
@@ -1093,6 +1144,36 @@ def test_extract_rm_pages_no_output(tmp_path):
         result = _extract_rm_pages("rmapi", "/Notebook", output)
 
     assert result == []
+
+
+def test_extract_rm_pages_extracts_original_pdf(tmp_path):
+    """Extracts original PDF from zip when annotations PDF is a tiny stub."""
+    output = tmp_path / "output"
+    output.mkdir()
+
+    # Create a real PDF inside a zip (simulating the original uploaded PDF)
+    original_pdf_data = b"%PDF-1.4 original full content" + b"\x00" * 500
+    zip_path = tmp_path / "notebook.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("abc-123.pdf", original_pdf_data)
+
+    # Small annotations stub
+    annotations_data = b"%PDF-1.4 stub"
+
+    def mock_run(cmd, **kwargs):
+        cwd = Path(kwargs.get("cwd", "."))
+        # geta produces both an annotations PDF and a zip
+        (cwd / "notebook-annotations.pdf").write_bytes(annotations_data)
+        shutil.copy2(zip_path, cwd / "notebook.zip")
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        result = _extract_rm_pages("rmapi", "/Notebook", output)
+
+    assert result is None  # PDF-based notebook
+    original = output / "original.pdf"
+    assert original.exists()
+    assert original.read_bytes() == original_pdf_data
 
 
 # --- Export notebook tests ---
@@ -1531,3 +1612,333 @@ def test_autolink_no_matches():
     text = "Nothing to link here"
     result = autolink_markdown(text, index)
     assert result == "Nothing to link here"
+
+
+# --- B1: Heading detection prompt tests ---
+
+
+def test_heading_rule_in_transcription_prompt():
+    """Heading detection rule exists in TRANSCRIPTION_PROMPT."""
+    assert "Detect headings:" in TRANSCRIPTION_PROMPT
+    assert "## for major topics" in TRANSCRIPTION_PROMPT
+
+
+def test_heading_rule_in_single_page_prompt():
+    """Heading detection rule exists in SINGLE_PAGE_PROMPT."""
+    assert "Detect headings:" in SINGLE_PAGE_PROMPT
+    assert "## for major topics" in SINGLE_PAGE_PROMPT
+
+
+# --- D1: Blank page detection tests ---
+
+
+def test_is_blank_page_no_paths(tmp_path):
+    """SVG without <path> elements is blank."""
+    svg = tmp_path / "blank.svg"
+    svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="1404" height="1872">'
+                   '<rect width="100%" height="100%" fill="white"/></svg>')
+    assert is_blank_page(svg) is True
+
+
+def test_is_blank_page_with_strokes(tmp_path):
+    """SVG with <path> elements is not blank."""
+    svg = tmp_path / "page.svg"
+    svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="1404" height="1872">'
+                   '<rect width="100%" height="100%" fill="white"/>'
+                   '<path d="M 100 100 L 200 200" stroke="black" stroke-width="2"/></svg>')
+    assert is_blank_page(svg) is False
+
+
+def test_sync_skips_blank_pages(tmp_path):
+    """Blank pages are skipped during transcription."""
+    rm_dir = tmp_path / "extracted" / "uuid"
+    rm_dir.mkdir(parents=True)
+    rm1 = rm_dir / "page1.rm"
+    rm2 = rm_dir / "page2.rm"
+    rm1.write_bytes(b"page1 content")
+    rm2.write_bytes(b"page2 content")
+
+    notebooks = [
+        {"id": "nb-1", "name": "Test", "version": 2, "modified": "2025-01-20", "path": "/Test"},
+    ]
+    state = {"nb-1": {"version": 1, "pages": {}}}
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="# Page content")]
+    mock_client.messages.create.return_value = mock_response
+
+    # SVG without paths (blank)
+    blank_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1404" height="1872"><rect fill="white"/></svg>'
+    # SVG with paths (not blank)
+    content_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1404" height="1872"><path d="M 1 1 L 2 2"/></svg>'
+
+    svg_call_count = [0]
+    def mock_render(rm_file):
+        svg_call_count[0] += 1
+        return blank_svg if svg_call_count[0] == 1 else content_svg
+
+    # Create a PNG with visible content for the PIL fallback in is_blank_page
+    from PIL import Image as PILImage, ImageDraw
+    contrast_img = PILImage.new("L", (100, 100), 255)  # white background
+    draw = ImageDraw.Draw(contrast_img)
+    draw.rectangle([10, 10, 90, 90], fill=0)  # black rectangle = high variance
+    contrast_buf = io.BytesIO()
+    contrast_img.save(contrast_buf, "PNG")
+    contrast_png = contrast_buf.getvalue()
+
+    with patch("remarkable_to_obsidian._extract_rm_pages", return_value=[rm1, rm2]), \
+         patch("remarkable_to_obsidian._render_rm_to_svg", side_effect=mock_render), \
+         patch("remarkable_to_obsidian._svg_to_png", return_value=contrast_png), \
+         patch("remarkable_to_obsidian.save_source_pages", return_value=[]), \
+         patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
+         patch("remarkable_to_obsidian.save_state"), \
+         patch("tempfile.mkdtemp", return_value=str(tmp_path)):
+        sync_notebooks(notebooks, state, str(tmp_path / "vault"), "rmapi", "claude-opus-4-6",
+                       dry_run=False, client=mock_client, state_file="/tmp/state.json",
+                       blank_detect=True)
+
+    # Only page 2 should have been transcribed (page 1 is blank - no <path> elements)
+    assert mock_client.messages.create.call_count == 1
+
+
+# --- A1: Context-aware prompt tests ---
+
+
+def test_build_page_context_basic():
+    """Basic context includes notebook name, path, and page info."""
+    nb = {"name": "Meeting Notes", "path": "/Work/Meeting Notes"}
+    ctx = _build_page_context(nb, 0, 5)
+    assert "Meeting Notes" in ctx
+    assert "/Work/Meeting Notes" in ctx
+    assert "Page 1 of 5" in ctx
+
+
+def test_build_page_context_with_prev():
+    """Context includes previous page preview when provided."""
+    nb = {"name": "Notes", "path": "/Notes"}
+    prev = "This is some content from the previous page that should be included"
+    ctx = _build_page_context(nb, 1, 3, prev_markdown=prev)
+    assert "Page 2 of 3" in ctx
+    assert "Previous page content:" in ctx
+    assert "This is some content" in ctx
+
+
+def test_transcribe_page_with_context(tmp_path):
+    """Context is appended to user content when provided."""
+    page = tmp_path / "page.png"
+    page.write_bytes(b"\x89PNG fake page")
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="# Content")]
+    mock_client.messages.create.return_value = mock_response
+
+    transcribe_page(mock_client, page, "claude-opus-4-6", context="Notebook: Test\nPage 1 of 3")
+
+    call_args = mock_client.messages.create.call_args
+    content = call_args.kwargs["messages"][0]["content"]
+    # Image + context text block
+    assert len(content) == 2
+    assert content[1]["type"] == "text"
+    assert "Context:" in content[1]["text"]
+
+
+# --- A2: Per-notebook prompt customization tests ---
+
+
+def test_resolve_prompt_specific_match():
+    """Matches specific notebook name via glob pattern."""
+    custom = [("Meeting*", "Custom meeting prompt"), ("*", "Default custom")]
+    result = resolve_prompt("Meeting Notes", "/Meeting Notes", custom, "fallback")
+    assert result == "Custom meeting prompt"
+
+
+def test_resolve_prompt_default_fallback():
+    """Falls back to default prompt when no patterns match."""
+    custom = [("Journal*", "Journal prompt")]
+    result = resolve_prompt("Meeting Notes", "/Meeting Notes", custom, "default prompt")
+    assert result == "default prompt"
+
+
+def test_resolve_prompt_hardcoded_fallback():
+    """Returns default when custom_prompts is empty."""
+    result = resolve_prompt("Anything", "/Anything", [], "hardcoded default")
+    assert result == "hardcoded default"
+
+
+# --- C1: Diagram classifier tests ---
+
+
+def test_classify_diagram_flowchart():
+    """Classifier returns a valid category."""
+    from remarkable_to_obsidian import _classify_diagram
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="flowchart")]
+    mock_client.messages.create.return_value = mock_response
+
+    result = _classify_diagram(mock_client, b"fake image", "claude-opus-4-6")
+    assert result == "flowchart"
+
+
+def test_classify_diagram_unknown_fallback():
+    """Unknown category falls back to 'sketch'."""
+    from remarkable_to_obsidian import _classify_diagram
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="something_unknown")]
+    mock_client.messages.create.return_value = mock_response
+
+    result = _classify_diagram(mock_client, b"fake image", "claude-opus-4-6")
+    assert result == "sketch"
+
+
+def test_convert_diagram_table_format():
+    """Tables are returned as markdown_table format."""
+    from remarkable_to_obsidian import _convert_diagram_to_vector
+    mock_client = MagicMock()
+
+    # First call: classify as table
+    classify_response = MagicMock()
+    classify_response.content = [MagicMock(text="table")]
+    # Second call: convert to markdown table
+    convert_response = MagicMock()
+    convert_response.content = [MagicMock(text="| Col A | Col B |\n|---|---|\n| 1 | 2 |")]
+    mock_client.messages.create.side_effect = [classify_response, convert_response]
+
+    fmt, content = _convert_diagram_to_vector(mock_client, b"fake image", "claude-opus-4-6")
+    assert fmt == "markdown_table"
+    assert "Col A" in content
+
+
+# --- C2: Mermaid validation tests ---
+
+
+def test_validate_mermaid_valid():
+    """Valid Mermaid syntax passes validation."""
+    valid, error = _validate_mermaid("flowchart TD\n    A --> B\n    B --> C")
+    assert valid is True
+    assert error == ""
+
+
+def test_validate_mermaid_invalid_type():
+    """Invalid diagram type declaration fails."""
+    valid, error = _validate_mermaid("invalid diagram\n    A --> B")
+    assert valid is False
+    assert "Invalid diagram type" in error
+
+
+def test_validate_mermaid_unmatched_brackets():
+    """Unmatched brackets fail validation."""
+    valid, error = _validate_mermaid("flowchart TD\n    A[Label --> B\n    B{{{test")
+    assert valid is False
+    assert "Unmatched brackets" in error
+
+
+def test_convert_diagram_retry_on_invalid():
+    """Retries conversion when Mermaid validation fails, falls back to PNG."""
+    from remarkable_to_obsidian import _convert_diagram_to_vector
+    mock_client = MagicMock()
+
+    # Classify as flowchart
+    classify_response = MagicMock()
+    classify_response.content = [MagicMock(text="flowchart")]
+    # All conversion attempts return invalid mermaid
+    bad_response = MagicMock()
+    bad_response.content = [MagicMock(text="invalid_stuff\n    broken")]
+    mock_client.messages.create.side_effect = [classify_response, bad_response, bad_response, bad_response]
+
+    fmt, content = _convert_diagram_to_vector(mock_client, b"fake image", "claude-opus-4-6")
+    assert fmt == "fallback_png"
+
+
+# --- B2: Task extraction tests ---
+
+
+def test_extract_tasks_basic():
+    """Extracts tasks from markdown content."""
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text='[{"text": "Send report", "assignee": "Alice", "due": null}]')]
+    mock_client.messages.create.return_value = mock_response
+
+    tasks = extract_tasks(mock_client, "# Meeting\n- Send report to Alice")
+    assert len(tasks) == 1
+    assert tasks[0]["text"] == "Send report"
+    assert tasks[0]["assignee"] == "Alice"
+
+
+def test_extract_tasks_invalid_json():
+    """Returns empty list on invalid JSON response."""
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="not valid json {{{")]
+    mock_client.messages.create.return_value = mock_response
+
+    tasks = extract_tasks(mock_client, "some content")
+    assert tasks == []
+
+
+def test_inject_tasks_into_markdown():
+    """Appends task section with checkboxes."""
+    markdown = "# Notes\n\nSome content"
+    tasks = [
+        {"text": "Send report", "assignee": "Alice", "due": "2026-03-15"},
+        {"text": "Review code", "assignee": None, "due": None},
+    ]
+    result = _inject_tasks(markdown, tasks)
+    assert "## Extracted Tasks" in result
+    assert "- [ ] Send report @Alice (due: 2026-03-15)" in result
+    assert "- [ ] Review code" in result
+
+
+def test_write_obsidian_note_with_tasks(tmp_path):
+    """Tasks appear in frontmatter when provided."""
+    vault = tmp_path / "vault"
+    notebook = {"id": "abc", "name": "Notes", "modified": "2025-01-01"}
+    tasks = [{"text": "Follow up", "assignee": None, "due": None}]
+    path = write_obsidian_note(str(vault), notebook, "# Content", tasks=tasks)
+    content = path.read_text()
+    assert "tasks:" in content
+    assert "Follow up" in content
+
+
+# --- B3: Tag inference tests ---
+
+
+def test_infer_tags_basic():
+    """Infers tags from markdown content."""
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text='["meeting-notes", "strategy", "planning"]')]
+    mock_client.messages.create.return_value = mock_response
+
+    tags = infer_tags(mock_client, "# Strategy Meeting\n- Discussed roadmap")
+    assert len(tags) == 3
+    assert "meeting-notes" in tags
+    assert "strategy" in tags
+
+
+def test_infer_tags_normalization():
+    """Tags are normalized to lowercase with hyphens."""
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text='["Meeting Notes", "STRATEGY", "product design"]')]
+    mock_client.messages.create.return_value = mock_response
+
+    tags = infer_tags(mock_client, "content")
+    assert "meeting-notes" in tags
+    assert "strategy" in tags
+    assert "product-design" in tags
+
+
+def test_infer_tags_invalid_json():
+    """Returns empty list on invalid JSON response."""
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text="not json")]
+    mock_client.messages.create.return_value = mock_response
+
+    tags = infer_tags(mock_client, "content")
+    assert tags == []

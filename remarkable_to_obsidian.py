@@ -358,6 +358,24 @@ def _extract_rm_pages(rmapi_bin: str, notebook_path: str, output_dir: Path) -> l
         rmdocs = list(output_dir.glob("*.rmdoc"))
         if rmdocs:
             _extract_content_tags(rmdocs[0], notebook_path)
+        # For PDF-based notebooks (uploaded PDFs with annotations), geta produces
+        # a tiny annotations-only PDF + a zip containing the original full PDF.
+        # Extract the original so callers can use it for source display and cropping.
+        zips = list(output_dir.glob("*.zip"))
+        if zips:
+            try:
+                with zipfile.ZipFile(zips[0]) as zf:
+                    for name in zf.namelist():
+                        if name.lower().endswith(".pdf"):
+                            pdf_data = zf.read(name)
+                            # Only use if substantially larger than the annotations stub
+                            if len(pdf_data) > pdfs[0].stat().st_size:
+                                original_path = output_dir / "original.pdf"
+                                original_path.write_bytes(pdf_data)
+                                log.info("Extracted original PDF from zip: %d bytes", len(pdf_data))
+                            break
+            except (zipfile.BadZipFile, KeyError):
+                pass
         return None
 
     # geta may have downloaded a zip/.rmdoc with .rm files instead
@@ -459,12 +477,30 @@ def export_notebook_pdf(rmapi_bin: str, notebook_path: str, name: str, output_di
     return pdf_path
 
 
+def is_blank_page(svg_path: Path) -> bool:
+    """Check if an SVG page is blank (no strokes). Uses path element check with PIL fallback."""
+    svg_text = svg_path.read_text()
+    if "<path " not in svg_text:
+        return True
+    # Fallback: render to PNG and check pixel variance
+    try:
+        from PIL import Image, ImageStat
+        png_data = _svg_to_png(svg_path)
+        img = Image.open(io.BytesIO(png_data)).convert("L")
+        if ImageStat.Stat(img).stddev[0] < 1.0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 TRANSCRIPTION_PROMPT = """Transcribe all handwritten text in this document to clean markdown.
 
 The images are numbered in order starting from 1 (image 1, image 2, etc.).
 
 Rules:
 - Infer structure: use headings, bullet lists, numbered lists as appropriate
+- Detect headings: text that is underlined, circled, or written larger should be treated as headings. Use ## for major topics and ### for subtopics.
 - For diagrams, sketches, or graphical elements that cannot be represented as text, output:
   > [Diagram(page=P, top=T, bottom=B): description]
   where P is the image number (1-based), T and B are the vertical position as
@@ -474,29 +510,29 @@ Rules:
 - Output ONLY the markdown transcription, no preamble or explanation"""
 
 
-def transcribe_pdf(client, pdf_path: Path, model: str) -> str:
+def transcribe_pdf(client, pdf_path: Path, model: str, context: str = "", system_prompt: str | None = None) -> str:
     """Send a PDF to Claude for handwriting transcription. Returns markdown string."""
     pdf_data = base64.standard_b64encode(pdf_path.read_bytes()).decode("utf-8")
+
+    prompt = system_prompt or TRANSCRIPTION_PROMPT
+    user_content: list[dict] = [
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": pdf_data,
+            },
+        },
+    ]
+    if context:
+        user_content.append({"type": "text", "text": f"Context:\n{context}"})
 
     message = client.messages.create(
         model=model,
         max_tokens=16384,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_data,
-                        },
-                    },
-                    {"type": "text", "text": TRANSCRIPTION_PROMPT},
-                ],
-            }
-        ],
+        system=[{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": user_content}],
     )
     return message.content[0].text
 
@@ -542,6 +578,7 @@ SINGLE_PAGE_PROMPT = """Transcribe all handwritten text in this page to clean ma
 
 Rules:
 - Infer structure: use headings, bullet lists, numbered lists as appropriate
+- Detect headings: text that is underlined, circled, or written larger should be treated as headings. Use ## for major topics and ### for subtopics.
 - For diagrams, sketches, or graphical elements that cannot be represented as text, output:
   > [Diagram(page=1, top=T, bottom=B): description]
   where T and B are the vertical position as percentages (0=top, 100=bottom).
@@ -550,23 +587,25 @@ Rules:
 - Output ONLY the markdown transcription, no preamble or explanation"""
 
 
-def transcribe_page(client, page_path: Path, model: str) -> str:
+def transcribe_page(client, page_path: Path, model: str, context: str = "", system_prompt: str | None = None) -> str:
     """Send a single page image to Claude for transcription. Returns markdown string."""
     page_data, media_type = _encode_page_image(page_path)
+
+    prompt = system_prompt or SINGLE_PAGE_PROMPT
+    user_content: list[dict] = [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": page_data},
+        },
+    ]
+    if context:
+        user_content.append({"type": "text", "text": f"Context:\n{context}"})
 
     message = client.messages.create(
         model=model,
         max_tokens=16384,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": media_type, "data": page_data},
-                },
-                {"type": "text", "text": SINGLE_PAGE_PROMPT},
-            ],
-        }],
+        system=[{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": user_content}],
     )
     return message.content[0].text
 
@@ -581,11 +620,10 @@ def transcribe_pages(client, page_paths: list[Path], model: str) -> str:
             "source": {"type": "base64", "media_type": media_type, "data": page_data},
         })
 
-    content.append({"type": "text", "text": TRANSCRIPTION_PROMPT})
-
     message = client.messages.create(
         model=model,
         max_tokens=16384,
+        system=[{"type": "text", "text": TRANSCRIPTION_PROMPT, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": content}],
     )
     return message.content[0].text
@@ -595,6 +633,86 @@ DIAGRAM_RE = re.compile(
     r'> \[Diagram\(page=(\d+),\s*top=(\d+),\s*bottom=(\d+)\):\s*(.+?)\]',
     re.DOTALL,
 )
+
+DIAGRAM_CLASSIFY_PROMPT = """Classify this handwritten diagram into exactly one category.
+Reply with ONLY the category name, nothing else.
+
+Categories: flowchart, sequence, mindmap, table, architecture, sketch"""
+
+DIAGRAM_TYPES: dict[str, str] = {
+    "flowchart": "Convert this flowchart to Mermaid syntax using 'flowchart TD' or 'flowchart LR'. Preserve all node labels and connections.",
+    "sequence": "Convert this sequence diagram to Mermaid syntax. Preserve all actors, messages, and ordering.",
+    "mindmap": "Convert this mind map to Mermaid mindmap syntax. Preserve the hierarchy and all labels.",
+    "table": "Convert this table to a markdown table. Use | column | separators and alignment rows.",
+    "architecture": "Convert this architecture/system diagram to Mermaid syntax. Preserve all components, connections, and labels.",
+    "sketch": "This is a freeform sketch. Output Excalidraw JSON (the 'elements' array) to reproduce it.",
+}
+
+
+def _classify_diagram(client, crop_image: bytes, model: str) -> str:
+    """Classify a diagram image into a category. Returns category string."""
+    image_data = base64.standard_b64encode(crop_image).decode("utf-8")
+    message = client.messages.create(
+        model=model,
+        max_tokens=50,
+        system=[{"type": "text", "text": DIAGRAM_CLASSIFY_PROMPT, "cache_control": {"type": "ephemeral"}}],
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": image_data},
+                },
+            ],
+        }],
+    )
+    category = message.content[0].text.strip().lower()
+    if category not in DIAGRAM_TYPES:
+        category = "sketch"
+    return category
+
+
+def _validate_mermaid(code: str) -> tuple[bool, str]:
+    """Validate Mermaid syntax. Returns (is_valid, error_message)."""
+    # Try mmdc CLI if available
+    if shutil.which("mmdc"):
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".mmd", delete=False) as f:
+                f.write(code)
+                f.flush()
+                result = subprocess.run(
+                    ["mmdc", "-i", f.name, "-o", "/dev/null"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                os.unlink(f.name)
+                if result.returncode == 0:
+                    return True, ""
+                return False, result.stderr.strip()
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    # Fallback: regex heuristics
+    lines = code.strip().split("\n")
+    if not lines:
+        return False, "Empty diagram"
+
+    first_line = lines[0].strip()
+    valid_types = [
+        "graph ", "flowchart ", "sequenceDiagram", "classDiagram",
+        "stateDiagram", "erDiagram", "gantt", "pie", "mindmap",
+        "gitGraph", "journey", "quadrantChart", "xychart",
+    ]
+    if not any(first_line.startswith(t) for t in valid_types):
+        return False, f"Invalid diagram type declaration: {first_line}"
+
+    # Check matched brackets
+    open_count = code.count("{") + code.count("[") + code.count("(")
+    close_count = code.count("}") + code.count("]") + code.count(")")
+    if abs(open_count - close_count) > 2:
+        return False, f"Unmatched brackets: {open_count} open vs {close_count} close"
+
+    return True, ""
+
 
 DIAGRAM_CONVERT_PROMPT = """Look at this handwritten diagram. Reproduce it as accurately as possible.
 
@@ -617,46 +735,99 @@ Then output the content."""
 
 def _convert_diagram_to_vector(client, crop_image: bytes, model: str) -> tuple[str, str]:
     """Send a cropped diagram image to Claude to reproduce as Mermaid or Excalidraw.
-    Returns (format, content) where format is 'mermaid' or 'excalidraw'."""
+    Returns (format, content) where format is 'mermaid', 'excalidraw', 'markdown_table', or 'fallback_png'."""
     image_data = base64.standard_b64encode(crop_image).decode("utf-8")
 
-    message = client.messages.create(
-        model=model,
-        max_tokens=8192,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": image_data},
-                },
-                {"type": "text", "text": DIAGRAM_CONVERT_PROMPT},
-            ],
-        }],
-    )
+    # Step 1: Classify the diagram type
+    category = _classify_diagram(client, crop_image, model)
 
-    response = message.content[0].text.strip()
-    lines = response.split("\n", 1)
+    # Tables get markdown format directly
+    if category == "table":
+        type_prompt = DIAGRAM_TYPES["table"]
+        message = client.messages.create(
+            model=model,
+            max_tokens=8192,
+            system=[{"type": "text", "text": type_prompt, "cache_control": {"type": "ephemeral"}}],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": image_data},
+                    },
+                ],
+            }],
+        )
+        content = message.content[0].text.strip()
+        # Strip code fences if present
+        content = re.sub(r'^```(?:markdown)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        return "markdown_table", content
 
-    if lines[0].startswith("FORMAT: mermaid"):
-        content = lines[1].strip() if len(lines) > 1 else ""
-        # Strip outer ```mermaid fences if present
+    # Step 2: Use type-specific prompt for conversion
+    type_prompt = DIAGRAM_TYPES.get(category, DIAGRAM_CONVERT_PROMPT)
+    if category == "sketch":
+        convert_prompt = DIAGRAM_CONVERT_PROMPT
+    else:
+        convert_prompt = type_prompt + "\n\nOutput ONLY the code, no explanation."
+
+    # Retry loop for Mermaid validation
+    messages: list[dict] = [{
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": image_data},
+            },
+        ],
+    }]
+
+    for attempt in range(3):
+        message = client.messages.create(
+            model=model,
+            max_tokens=8192,
+            system=[{"type": "text", "text": convert_prompt, "cache_control": {"type": "ephemeral"}}],
+            messages=messages,
+        )
+
+        response = message.content[0].text.strip()
+        lines = response.split("\n", 1)
+
+        if lines[0].startswith("FORMAT: mermaid"):
+            content = lines[1].strip() if len(lines) > 1 else ""
+        elif lines[0].startswith("FORMAT: excalidraw"):
+            content = lines[1].strip() if len(lines) > 1 else ""
+            content = re.sub(r'^```json\s*\n?', '', content)
+            content = re.sub(r'\n?```\s*$', '', content)
+            return "excalidraw", content
+        elif "```mermaid" in response or "graph " in response or "flowchart " in response:
+            content = response
+        elif category == "sketch":
+            return "excalidraw", response
+        else:
+            content = response
+
+        # Strip mermaid fences
         content = re.sub(r'^```mermaid\s*\n?', '', content)
         content = re.sub(r'\n?```\s*$', '', content)
-        return "mermaid", content
-    elif lines[0].startswith("FORMAT: excalidraw"):
-        content = lines[1].strip() if len(lines) > 1 else ""
-        # Strip outer ```json fences if present
-        content = re.sub(r'^```json\s*\n?', '', content)
-        content = re.sub(r'\n?```\s*$', '', content)
-        return "excalidraw", content
-    else:
-        # Fallback: try to detect from content
-        if "```mermaid" in response or "graph " in response or "flowchart " in response:
-            content = re.sub(r'^```mermaid\s*\n?', '', response)
-            content = re.sub(r'\n?```\s*$', '', content)
+
+        # Validate Mermaid output
+        if category not in ("sketch",):
+            valid, error = _validate_mermaid(content)
+            if valid:
+                return "mermaid", content
+            log.warning("Mermaid validation failed (attempt %d): %s", attempt + 1, error)
+            if attempt < 2:
+                # Add error feedback for retry
+                messages.append({"role": "assistant", "content": response})
+                messages.append({"role": "user", "content": f"The Mermaid syntax is invalid: {error}\nPlease fix and output only valid Mermaid code."})
+                continue
+            # All retries exhausted - fall back to PNG
+            return "fallback_png", ""
+        else:
             return "mermaid", content
-        return "excalidraw", response
+
+    return "fallback_png", ""
 
 
 def _write_excalidraw_file(elements_json: str, file_path: Path, description: str) -> None:
@@ -719,10 +890,20 @@ def extract_diagram_crops(
 
         page_path = page_paths[page_num - 1]
         try:
-            # Load the PNG (convert SVG first if needed)
+            # Load the page as a PIL Image
             if page_path.suffix.lower() == ".svg":
                 png_data = _svg_to_png(page_path)
                 img = Image.open(io.BytesIO(png_data))
+            elif page_path.suffix.lower() == ".pdf":
+                import fitz  # PyMuPDF
+                doc = fitz.open(str(page_path))
+                # For single-PDF sources, page_num selects the page within the PDF
+                pdf_page_idx = page_num - 1 if len(page_paths) == 1 else 0
+                if pdf_page_idx >= len(doc):
+                    return match.group(0)
+                pix = doc[pdf_page_idx].get_pixmap(dpi=150)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                doc.close()
             else:
                 img = Image.open(page_path)
 
@@ -751,7 +932,10 @@ def extract_diagram_crops(
             if client and model:
                 try:
                     fmt, content = _convert_diagram_to_vector(client, crop_bytes, model)
-                    if fmt == "mermaid" and content.strip():
+                    if fmt == "markdown_table" and content.strip():
+                        log.info("Converted diagram %d to markdown table", crop_counter)
+                        return f"> *{description}*\n\n{content}"
+                    elif fmt == "mermaid" and content.strip():
                         log.info("Converted diagram %d to Mermaid", crop_counter)
                         return f"> *{description}*\n\n```mermaid\n{content}\n```"
                     elif fmt == "excalidraw" and content.strip():
@@ -761,6 +945,7 @@ def extract_diagram_crops(
                         saved_crops.append(excalidraw_name)
                         log.info("Converted diagram %d to Excalidraw", crop_counter)
                         return f"> *{description}*\n\n![[{excalidraw_name}]]"
+                    # fallback_png: fall through to image embed
                 except Exception:
                     log.warning("Failed to convert diagram %d to vector, using image", crop_counter, exc_info=True)
 
@@ -872,7 +1057,7 @@ def _move_obsidian_note_legacy(vault_path: str, notebook: dict) -> None:
         log.warning("Multiple notes named %s found — skipping legacy move", safe_name)
 
 
-def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_files: list[str] | None = None) -> Path:
+def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_files: list[str] | None = None, tasks: list[dict] | None = None) -> Path:
     """Write a markdown note with YAML frontmatter to the Obsidian vault inbox."""
     # Preserve reMarkable folder structure under Remarkable Notes/
     rm_path = notebook.get("path", "")
@@ -914,6 +1099,11 @@ def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_f
     for tag in tags:
         lines.append(f"  - {tag}")
 
+    if tasks:
+        lines.append("tasks:")
+        for task in tasks:
+            lines.append(f'  - "{task.get("text", "")}"')
+
     lines.append("---")
     frontmatter = "\n".join(lines) + "\n"
 
@@ -934,6 +1124,136 @@ def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# --- A1: Context-aware prompts ---
+
+
+def _build_page_context(notebook: dict, page_index: int, total_pages: int, prev_markdown: str = "") -> str:
+    """Build context string for a page transcription request."""
+    parts = [
+        f"Notebook: {notebook['name']}",
+        f"Path: {notebook.get('path', '')}",
+        f"Page {page_index + 1} of {total_pages}",
+    ]
+    if prev_markdown:
+        preview = prev_markdown[:300]
+        if len(prev_markdown) > 300:
+            preview += "..."
+        parts.append(f"Previous page content:\n{preview}")
+    return "\n".join(parts)
+
+
+# --- A2: Per-notebook prompt customization ---
+
+
+def _load_custom_prompts() -> list[tuple[str, str]]:
+    """Read prompts/*.txt from the script directory. Returns [(glob_pattern, prompt_text)] sorted by specificity."""
+    prompts_dir = Path(__file__).parent / "prompts"
+    if not prompts_dir.is_dir():
+        return []
+    entries = []
+    for txt_file in sorted(prompts_dir.glob("*.txt")):
+        pattern = txt_file.stem  # filename without .txt is the glob pattern
+        prompt_text = txt_file.read_text().strip()
+        if prompt_text:
+            entries.append((pattern, prompt_text))
+    # Sort by specificity: longer patterns first (more specific)
+    entries.sort(key=lambda e: len(e[0]), reverse=True)
+    return entries
+
+
+def resolve_prompt(notebook_name: str, notebook_path: str, custom_prompts: list[tuple[str, str]], default_prompt: str) -> str:
+    """Resolve which prompt to use for a notebook. Glob-matches against custom prompts."""
+    for pattern, prompt_text in custom_prompts:
+        if fnmatch.fnmatch(notebook_name, pattern) or fnmatch.fnmatch(notebook_path, pattern):
+            return prompt_text
+    return default_prompt
+
+
+# --- B2: Task extraction ---
+
+
+TASK_EXTRACTION_PROMPT = """Extract action items from this text. Return a JSON array of objects with these fields:
+- "text": the action item description
+- "assignee": person responsible (null if unclear)
+- "due": due date if mentioned (null if none)
+
+Return ONLY valid JSON, no explanation. If no tasks found, return [].
+
+Example: [{"text": "Send report to team", "assignee": "Alice", "due": "2026-03-15"}]"""
+
+TASK_MODEL = "claude-haiku-4-5-20241022"
+
+
+def extract_tasks(client, markdown: str, model: str = TASK_MODEL) -> list[dict]:
+    """Extract action items from markdown text using a lightweight model. Returns list of task dicts."""
+    message = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        system=[{"type": "text", "text": TASK_EXTRACTION_PROMPT, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": markdown}],
+    )
+    try:
+        text = message.content[0].text.strip()
+        # Strip code fences if present
+        text = re.sub(r'^```(?:json)?\s*\n?', '', text)
+        text = re.sub(r'\n?```\s*$', '', text)
+        tasks = json.loads(text)
+        if isinstance(tasks, list):
+            return tasks
+    except (json.JSONDecodeError, IndexError):
+        log.warning("Failed to parse task extraction response as JSON")
+    return []
+
+
+def _inject_tasks(markdown: str, tasks: list[dict]) -> str:
+    """Append an Extracted Tasks section with checkboxes to the markdown."""
+    if not tasks:
+        return markdown
+    lines = ["\n\n## Extracted Tasks\n"]
+    for task in tasks:
+        text = task.get("text", "")
+        assignee = task.get("assignee")
+        due = task.get("due")
+        suffix = ""
+        if assignee:
+            suffix += f" @{assignee}"
+        if due:
+            suffix += f" (due: {due})"
+        lines.append(f"- [ ] {text}{suffix}")
+    return markdown + "\n".join(lines) + "\n"
+
+
+# --- B3: Tag inference ---
+
+
+TAG_INFERENCE_PROMPT = """Analyze this text and suggest 3-5 semantic tags that describe its content.
+Return ONLY a JSON array of lowercase tag strings, no explanation.
+Tags should be short (1-2 words), use hyphens for multi-word tags.
+
+Example: ["meeting-notes", "strategy", "quarterly-planning", "finance"]"""
+
+
+def infer_tags(client, markdown: str, model: str = TASK_MODEL) -> list[str]:
+    """Infer semantic tags from markdown content using a lightweight model."""
+    message = client.messages.create(
+        model=model,
+        max_tokens=256,
+        system=[{"type": "text", "text": TAG_INFERENCE_PROMPT, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": markdown}],
+    )
+    try:
+        text = message.content[0].text.strip()
+        text = re.sub(r'^```(?:json)?\s*\n?', '', text)
+        text = re.sub(r'\n?```\s*$', '', text)
+        tags = json.loads(text)
+        if isinstance(tags, list):
+            # Normalize: lowercase, strip, replace spaces with hyphens
+            return [t.strip().lower().replace(" ", "-") for t in tags if isinstance(t, str) and t.strip()]
+    except (json.JSONDecodeError, IndexError):
+        log.warning("Failed to parse tag inference response as JSON")
+    return []
+
+
 def sync_notebooks(
     notebooks: list[dict],
     state: dict,
@@ -944,6 +1264,10 @@ def sync_notebooks(
     client,
     state_file: str,
     note_index: dict[str, str] | None = None,
+    extract_tasks_enabled: bool = False,
+    infer_tags_enabled: bool = False,
+    blank_detect: bool = True,
+    custom_prompts: list[tuple[str, str]] | None = None,
 ) -> SyncSummary:
     """Process each notebook: skip unchanged, export, transcribe changed pages, write."""
     summary = SyncSummary()
@@ -960,7 +1284,7 @@ def sync_notebooks(
         if old_path and (old_path != nb["path"] or old_name != nb["name"]):
             _move_obsidian_note(vault_path, old_path, old_name or Path(old_path).name, nb)
         elif not old_path and nb_state:
-            # Legacy state without stored path — search for existing note by name
+            # Legacy state without stored path - search for existing note by name
             _move_obsidian_note_legacy(vault_path, nb)
 
         if nb_state.get("version") == nb["version"] and nb["version"] != 0:
@@ -973,6 +1297,13 @@ def sync_notebooks(
             log.info("Skipping %s (unchanged, version %s)", nb["name"], nb["version"])
             summary.results.append(SyncResult(nb["name"], nb["path"], "skipped", "unchanged"))
             continue
+
+        # A2: Resolve custom prompt for this notebook
+        nb_prompt = None
+        if custom_prompts:
+            nb_prompt = resolve_prompt(nb["name"], nb.get("path", ""), custom_prompts, SINGLE_PAGE_PROMPT)
+            if nb_prompt == SINGLE_PAGE_PROMPT:
+                nb_prompt = None  # no override, use default
 
         log.info("Processing: %s", nb["name"])
         tmp_dir = Path(tempfile.mkdtemp())
@@ -987,21 +1318,39 @@ def sync_notebooks(
                 nb["tags"] = list({*existing, *content_tags})
 
             if rm_pages is None:
-                # PDF-based notebook — no per-page tracking, full re-transcription
+                # PDF-based notebook - no per-page tracking, full re-transcription
                 pdfs = list(tmp_dir.glob("*.pdf"))
                 if not pdfs:
                     continue
+                # Use original.pdf (extracted from zip) for source display and cropping
+                # if available; the annotations PDF is a tiny stub for uploaded PDFs
+                original_pdf = tmp_dir / "original.pdf"
+                source_pdfs = [original_pdf] if original_pdf.exists() else pdfs
                 if dry_run:
                     log.info("[DRY RUN] Would transcribe %s (PDF, %d bytes)", nb["name"], pdfs[0].stat().st_size)
                     summary.results.append(SyncResult(nb["name"], nb["path"], "dry_run", "PDF"))
                     continue
-                markdown = transcribe_pdf(client, pdfs[0], model)
-                markdown, _ = extract_diagram_crops(markdown, pdfs, vault_path, nb["name"], client=client, model=model)
+                # A1: Build context for PDF
+                pdf_context = f"Notebook: {nb['name']}\nPath: {nb.get('path', '')}"
+                markdown = transcribe_pdf(client, pdfs[0], model, context=pdf_context, system_prompt=nb_prompt)
+                markdown, _ = extract_diagram_crops(markdown, source_pdfs, vault_path, nb["name"], client=client, model=model)
                 if note_index:
                     markdown = autolink_markdown(markdown, note_index)
-                source_files = save_source_pages(vault_path, nb, pdfs)
-                nb["page_count"] = len(pdfs)
-                note_path = write_obsidian_note(vault_path, nb, markdown, source_files)
+                # B2: Extract tasks if enabled
+                tasks = None
+                if extract_tasks_enabled:
+                    tasks = extract_tasks(client, markdown)
+                    if tasks:
+                        markdown = _inject_tasks(markdown, tasks)
+                # B3: Infer tags if enabled
+                if infer_tags_enabled:
+                    inferred = infer_tags(client, markdown)
+                    if inferred:
+                        existing_tags = nb.get("tags", [])
+                        nb["tags"] = list({*existing_tags, *inferred})
+                source_files = save_source_pages(vault_path, nb, source_pdfs)
+                nb["page_count"] = len(source_pdfs)
+                note_path = write_obsidian_note(vault_path, nb, markdown, source_files, tasks=tasks)
                 log.info("Wrote %s (%d chars)", note_path, len(markdown))
                 state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"]}
                 save_state(state_file, state)
@@ -1051,16 +1400,25 @@ def sync_notebooks(
 
             # Transcribe only changed pages, reuse cached markdown for others
             page_markdowns = {}
+            prev_markdown = ""
             for i in range(len(rm_pages)):
                 if i in changed_indices:
+                    # D1: Skip blank pages
+                    if blank_detect and is_blank_page(svg_paths[i]):
+                        log.info("Skipping page %d/%d (blank)", i + 1, len(rm_pages))
+                        page_markdowns[str(i)] = ""
+                        continue
                     log.info("Transcribing page %d/%d (changed)", i + 1, len(rm_pages))
-                    md = transcribe_page(client, svg_paths[i], model)
+                    # A1: Build context for this page
+                    ctx = _build_page_context(nb, i, len(rm_pages), prev_markdown=prev_markdown)
+                    md = transcribe_page(client, svg_paths[i], model, context=ctx, system_prompt=nb_prompt)
                     # Fix diagram page references to use page=1 since we send one at a time
                     md = md.replace("page=1", f"page={i+1}")
                     page_markdowns[str(i)] = md
                 else:
                     log.info("Reusing cached transcription for page %d/%d", i + 1, len(rm_pages))
                     page_markdowns[str(i)] = cached_pages[str(i)]["markdown"]
+                prev_markdown = page_markdowns[str(i)]
 
             # Assemble full markdown
             all_parts = [page_markdowns[str(i)] for i in range(len(rm_pages))]
@@ -1072,9 +1430,23 @@ def sync_notebooks(
             if note_index:
                 markdown = autolink_markdown(markdown, note_index)
 
+            # B2: Extract tasks if enabled
+            tasks = None
+            if extract_tasks_enabled:
+                tasks = extract_tasks(client, markdown)
+                if tasks:
+                    markdown = _inject_tasks(markdown, tasks)
+
+            # B3: Infer tags if enabled
+            if infer_tags_enabled:
+                inferred = infer_tags(client, markdown)
+                if inferred:
+                    existing_tags = nb.get("tags", [])
+                    nb["tags"] = list({*existing_tags, *inferred})
+
             source_files = save_source_pages(vault_path, nb, svg_paths)
             nb["page_count"] = len(rm_pages)
-            note_path = write_obsidian_note(vault_path, nb, markdown, source_files)
+            note_path = write_obsidian_note(vault_path, nb, markdown, source_files, tasks=tasks)
             log.info("Wrote %s (%d chars, %d/%d pages transcribed)",
                      note_path, len(markdown), len(changed_indices), len(rm_pages))
             summary.results.append(SyncResult(nb["name"], nb["path"], "synced", f"{len(changed_indices)}/{len(rm_pages)} pages transcribed"))
@@ -1347,6 +1719,9 @@ def main():
     parser.add_argument("--merge-states", nargs="+", metavar="FILE", help="Merge state files into main state and exit")
     parser.add_argument("--retag", action="store_true", help="Re-download notebooks to sync tags without re-transcribing")
     parser.add_argument("--no-autolink", action="store_true", help="Disable auto-linking of vault note names in transcriptions")
+    parser.add_argument("--no-blank-detect", action="store_true", help="Disable blank page detection (skip API calls for empty pages)")
+    parser.add_argument("--extract-tasks", action="store_true", help="Extract action items from transcriptions using Haiku")
+    parser.add_argument("--infer-tags", action="store_true", help="Infer semantic tags from transcriptions using Haiku")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1422,10 +1797,19 @@ def main():
         note_index = build_note_index(config["obsidian_vault"])
         log.info("Built note index: %d entries", len(note_index))
 
+    # A2: Load custom prompts
+    custom_prompts = _load_custom_prompts()
+    if custom_prompts:
+        log.info("Loaded %d custom prompt(s)", len(custom_prompts))
+
     summary = sync_notebooks(
         notebooks, state, config["obsidian_vault"], config["rmapi_bin"],
         config["model"], args.dry_run, client, config["state_file"],
         note_index=note_index,
+        extract_tasks_enabled=args.extract_tasks,
+        infer_tags_enabled=args.infer_tags,
+        blank_detect=not args.no_blank_detect,
+        custom_prompts=custom_prompts or None,
     )
 
     # Write sync log (skip for dry-run or empty results)
