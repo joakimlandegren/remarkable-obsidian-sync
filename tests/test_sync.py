@@ -594,8 +594,8 @@ def test_sync_incremental_pages(tmp_path):
     mock_client.messages.create.return_value = mock_response
 
     with patch("remarkable_to_obsidian._extract_rm_pages", return_value=[rm1, rm2]), \
-         patch("remarkable_to_obsidian._render_rm_to_svg", return_value='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1404 1872" width="1404" height="1872"><rect width="100%" height="100%" fill="white"/><path d="M 100 100 L 200 200" stroke="black"/></svg>'), \
-         patch("remarkable_to_obsidian.save_source_pages", return_value=[]), \
+         patch("remarkable_to_obsidian._render_rm_to_svg", return_value='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1404 1872" width="1404" height="1872"><rect width="100%" height="100%" fill="white"/><path d="M 100 100 L 200 200" stroke="black"/></svg>') as mock_render, \
+         patch("remarkable_to_obsidian.save_source_pages", return_value=[]) as mock_save, \
          patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
          patch("remarkable_to_obsidian.save_state"), \
          patch("tempfile.mkdtemp", return_value=str(tmp_path)):
@@ -609,6 +609,15 @@ def test_sync_incremental_pages(tmp_path):
     written_md = mock_write.call_args.args[2]
     assert "# Page 1 cached" in written_md
     assert "# Page 2 updated" in written_md
+
+    # Only the changed page (index 1) should have been rendered to SVG
+    assert mock_render.call_count == 1
+    mock_render.assert_called_once_with(rm2)
+
+    # save_source_pages should receive changed_indices={1}
+    mock_save.assert_called_once()
+    _, kwargs = mock_save.call_args
+    assert kwargs["changed_indices"] == {1}
 
 
 # --- .env loading tests ---

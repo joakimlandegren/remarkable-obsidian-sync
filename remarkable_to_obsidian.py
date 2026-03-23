@@ -885,8 +885,8 @@ def extract_diagram_crops(
         bottom_pct = int(match.group(3))
         description = match.group(4).strip()
 
-        if page_num < 1 or page_num > len(page_paths):
-            return match.group(0)  # leave as-is if page out of range
+        if page_num < 1 or page_num > len(page_paths) or page_paths[page_num - 1] is None:
+            return match.group(0)  # leave as-is if page out of range or not rendered
 
         page_path = page_paths[page_num - 1]
         try:
@@ -964,28 +964,42 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9 _-]", "_", name)
 
 
-def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path]) -> list[str]:
-    """Save source page images to the vault Attachments folder. Returns list of filenames."""
+def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path], changed_indices: set[int] | None = None) -> list[str]:
+    """Save source page images to the vault Attachments folder. Returns list of filenames.
+
+    When *changed_indices* is provided, only pages whose index is in the set
+    are actually written to disk.  Filenames for unchanged pages are still
+    returned so the markdown note can embed all pages.
+    """
     attachments = Path(vault_path) / "Attachments" / "reMarkable"
     attachments.mkdir(parents=True, exist_ok=True)
 
     safe_name = sanitize_filename(notebook["name"])
     saved = []
     for i, page_path in enumerate(page_paths):
-        suffix = page_path.suffix.lower()
-        if suffix == ".svg":
-            # Convert SVG to PNG for display in Obsidian
-            png_data = _svg_to_png(page_path)
-            dest_name = f"{safe_name} - page {i+1}.png"
-            (attachments / dest_name).write_bytes(png_data)
-        elif suffix == ".pdf":
+        # Determine the destination filename regardless of whether we write
+        suffix = page_path.suffix.lower() if page_path else ".svg"
+        if suffix == ".pdf":
             dest_name = f"{safe_name}.pdf"
-            shutil.copy2(page_path, attachments / dest_name)
         else:
-            dest_name = f"{safe_name} - page {i+1}{suffix}"
-            shutil.copy2(page_path, attachments / dest_name)
+            dest_name = f"{safe_name} - page {i+1}.png"
+
+        # Only write to disk if this page changed (or no filter given)
+        if changed_indices is None or i in changed_indices:
+            if page_path is None:
+                saved.append(dest_name)
+                continue
+            if suffix == ".svg":
+                png_data = _svg_to_png(page_path)
+                (attachments / dest_name).write_bytes(png_data)
+            elif suffix == ".pdf":
+                shutil.copy2(page_path, attachments / dest_name)
+            else:
+                dest_name = f"{safe_name} - page {i+1}{suffix}"
+                shutil.copy2(page_path, attachments / dest_name)
+            log.info("Saved source: %s", dest_name)
+
         saved.append(dest_name)
-        log.info("Saved source: %s", dest_name)
 
     return saved
 
@@ -1390,13 +1404,13 @@ def sync_notebooks(
                 summary.results.append(SyncResult(nb["name"], nb["path"], "dry_run", f"{len(changed_indices)}/{len(rm_pages)} pages changed"))
                 continue
 
-            # Render all pages to SVG (needed for source images)
-            svg_paths = []
-            for i, rm_file in enumerate(rm_pages):
-                svg_content = _render_rm_to_svg(rm_file)
+            # Render only changed pages to SVG (skip unchanged to save CPU)
+            svg_paths = [None] * len(rm_pages)
+            for i in changed_indices:
+                svg_content = _render_rm_to_svg(rm_pages[i])
                 svg_path = tmp_dir / f"page_{i+1}.svg"
                 svg_path.write_text(svg_content)
-                svg_paths.append(svg_path)
+                svg_paths[i] = svg_path
 
             # Transcribe only changed pages, reuse cached markdown for others
             page_markdowns = {}
@@ -1444,7 +1458,7 @@ def sync_notebooks(
                     existing_tags = nb.get("tags", [])
                     nb["tags"] = list({*existing_tags, *inferred})
 
-            source_files = save_source_pages(vault_path, nb, svg_paths)
+            source_files = save_source_pages(vault_path, nb, svg_paths, changed_indices=set(changed_indices))
             nb["page_count"] = len(rm_pages)
             note_path = write_obsidian_note(vault_path, nb, markdown, source_files, tasks=tasks)
             log.info("Wrote %s (%d chars, %d/%d pages transcribed)",
