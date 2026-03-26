@@ -96,6 +96,34 @@ uv run python remarkable_to_obsidian.py
 RM_WATCH_PATH="/Work/Meeting Notes" uv run python remarkable_to_obsidian.py
 ```
 
+### Re-tag without re-transcribing
+
+Update tags from reMarkable metadata without re-running transcription:
+
+```bash
+uv run python remarkable_to_obsidian.py --retag
+```
+
+### Task extraction and tag inference
+
+Optionally extract action items or infer semantic tags from transcriptions using a lightweight model:
+
+```bash
+# Extract action items (inserted as task lists in each note)
+uv run python remarkable_to_obsidian.py --extract-tasks
+
+# Infer semantic tags (added to YAML frontmatter)
+uv run python remarkable_to_obsidian.py --infer-tags
+```
+
+### Disabling auto-linking and blank detection
+
+By default, the sync auto-links known vault note names as Obsidian `[[wikilinks]]` and skips blank pages to save API calls. Both can be disabled:
+
+```bash
+uv run python remarkable_to_obsidian.py --no-autolink --no-blank-detect
+```
+
 ### Excluding notebooks
 
 Create a `.sync_ignore` file in the project root to skip specific notebooks. One pattern per line, supports glob wildcards:
@@ -108,6 +136,10 @@ Financial Core*
 ```
 
 Patterns match against both the notebook name and its full reMarkable path.
+
+### Custom prompts
+
+Place `.txt` files in a `prompts/` directory next to the script. Each filename is a glob pattern matched against notebook names/paths — the file content is used as the transcription prompt for matching notebooks.
 
 ### Parallel batch sync
 
@@ -140,6 +172,8 @@ Each note includes:
 
 Source page images are saved to `<vault>/Attachments/reMarkable/`.
 
+A rolling sync log is maintained at `<vault>/Remarkable Notes/Sync Log.md` (newest first, max 10 entries).
+
 ### Diagram conversion
 
 Handwritten diagrams are automatically converted to editable formats:
@@ -161,17 +195,41 @@ This minimizes API usage and sync time.
 
 ## Automatic sync (macOS)
 
-Set up hourly sync during daytime using launchd:
+The included `sync.sh` wrapper runs the sync hourly between 8am and 10pm. Create a launchd plist to schedule it:
 
 ```bash
-# Copy the plist to LaunchAgents
-cp com.remarkable.obsidian-sync.plist ~/Library/LaunchAgents/
+cat > ~/Library/LaunchAgents/com.remarkable.obsidian-sync.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.remarkable.obsidian-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>SYNC_SH_PATH</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/rm_sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/rm_sync.log</string>
+</dict>
+</plist>
+EOF
+```
 
-# Load it
+Replace `SYNC_SH_PATH` with the absolute path to `sync.sh` (e.g., `/Users/you/remarkable-obsidian-sync/sync.sh`).
+
+Then load it:
+
+```bash
 launchctl load ~/Library/LaunchAgents/com.remarkable.obsidian-sync.plist
 ```
 
-The included `sync.sh` wrapper runs the sync hourly between 8am and 10pm. Logs go to `/tmp/rm_sync.log`.
+Logs go to `/tmp/rm_sync.log`.
 
 ```bash
 # Run immediately
