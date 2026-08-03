@@ -791,7 +791,9 @@ def test_encode_page_image_png(tmp_path):
     """PNG files return base64 + image/png."""
     png = tmp_path / "page.png"
     png.write_bytes(b"\x89PNG fake")
-    data, media_type = _encode_page_image(png)
+    tiles = _encode_page_image(png)
+    assert len(tiles) == 1
+    data, media_type = tiles[0]
     assert media_type == "image/png"
     assert base64.standard_b64decode(data) == b"\x89PNG fake"
 
@@ -800,7 +802,9 @@ def test_encode_page_image_pdf(tmp_path):
     """PDF files return base64 + application/pdf."""
     pdf = tmp_path / "doc.pdf"
     pdf.write_bytes(b"%PDF-1.4")
-    data, media_type = _encode_page_image(pdf)
+    tiles = _encode_page_image(pdf)
+    assert len(tiles) == 1
+    data, media_type = tiles[0]
     assert media_type == "application/pdf"
     assert base64.standard_b64decode(data) == b"%PDF-1.4"
 
@@ -811,9 +815,11 @@ def test_encode_page_image_svg(tmp_path):
     svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"></svg>')
 
     fake_png = b"\x89PNG converted"
-    with patch("remarkable_to_obsidian._svg_to_png", return_value=fake_png):
-        data, media_type = _encode_page_image(svg)
+    with patch("remarkable_to_obsidian._svg_to_png", return_value=[fake_png]):
+        tiles = _encode_page_image(svg)
 
+    assert len(tiles) == 1
+    data, media_type = tiles[0]
     assert media_type == "image/png"
     assert base64.standard_b64decode(data) == fake_png
 
@@ -822,28 +828,43 @@ def test_encode_page_image_svg(tmp_path):
 
 
 def test_svg_to_png_normal_dimensions(tmp_path):
-    """Uses original width when dimensions are within limits."""
+    """Standard reMarkable page (1404×1872) — sent as single image."""
     svg = tmp_path / "page.svg"
     svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="1404" height="1872"></svg>')
 
     with patch("cairosvg.svg2png", return_value=b"png_bytes") as mock_cairo:
         result = _svg_to_png(svg)
 
-    assert result == b"png_bytes"
+    # API would resize to ~1175px wide — still readable, so no tiling
+    assert result == [b"png_bytes"]
     mock_cairo.assert_called_once_with(url=str(svg), output_width=1404)
 
 
-def test_svg_to_png_oversized(tmp_path):
-    """Scales down when dimensions exceed MAX_IMAGE_DIM."""
+def test_svg_to_png_tall_page_tiles(tmp_path):
+    """Very tall page is split into tiles to preserve readable width."""
+    from PIL import Image
     svg = tmp_path / "page.svg"
     svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="1404" height="10000"></svg>')
 
-    with patch("cairosvg.svg2png", return_value=b"png_bytes") as mock_cairo:
-        _svg_to_png(svg)
+    # Create a fake full-size PNG for cairosvg to "return"
+    fake_img = Image.new("RGB", (1404, 10000), "white")
+    buf = io.BytesIO()
+    fake_img.save(buf, format="PNG")
+    fake_png = buf.getvalue()
 
-    # Scale = min(8000/10000, 8000/1404) = 0.8
-    expected_width = int(1404 * 0.8)
-    mock_cairo.assert_called_once_with(url=str(svg), output_width=expected_width)
+    with patch("cairosvg.svg2png", return_value=fake_png):
+        tiles = _svg_to_png(svg)
+
+    # 10000px tall / 1568px tile height = 7 tiles (ceil)
+    # API would resize 1404×10000 → width ~220px (below 800), so tiling kicks in
+    assert len(tiles) == 7
+    tile1 = Image.open(io.BytesIO(tiles[0]))
+    assert tile1.height == 1568
+    assert tile1.width == 1404
+    # Last tile is the remainder
+    last = Image.open(io.BytesIO(tiles[-1]))
+    assert last.height == 10000 - 1568 * 6  # 1592
+    assert last.width == 1404
 
 
 # --- Transcription tests (page-level) ---
@@ -1019,7 +1040,7 @@ def test_save_source_pages_svg(tmp_path):
     svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"></svg>')
 
     notebook = {"name": "Drawing"}
-    with patch("remarkable_to_obsidian._svg_to_png", return_value=b"\x89PNG converted"):
+    with patch("remarkable_to_obsidian._svg_to_full_png", return_value=b"\x89PNG converted"):
         result = save_source_pages(str(vault), notebook, [svg])
 
     assert result == ["Drawing - page 1.png"]
@@ -1698,7 +1719,7 @@ def test_sync_skips_blank_pages(tmp_path):
 
     with patch("remarkable_to_obsidian._extract_rm_pages", return_value=[rm1, rm2]), \
          patch("remarkable_to_obsidian._render_rm_to_svg", side_effect=mock_render), \
-         patch("remarkable_to_obsidian._svg_to_png", return_value=contrast_png), \
+         patch("remarkable_to_obsidian._svg_to_png", return_value=[contrast_png]), \
          patch("remarkable_to_obsidian.save_source_pages", return_value=[]), \
          patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
          patch("remarkable_to_obsidian.save_state"), \

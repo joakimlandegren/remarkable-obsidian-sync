@@ -575,7 +575,7 @@ def is_blank_page(svg_path: Path) -> bool:
     # Fallback: render to PNG and check pixel variance
     try:
         from PIL import Image, ImageStat
-        png_data = _svg_to_png(svg_path)
+        png_data = _svg_to_png(svg_path)[0]  # first tile is sufficient for blank check
         img = Image.open(io.BytesIO(png_data)).convert("L")
         if ImageStat.Stat(img).stddev[0] < 1.0:
             return True
@@ -627,41 +627,105 @@ def transcribe_pdf(client, pdf_path: Path, model: str, context: str = "", system
     return message.content[0].text
 
 
-MAX_IMAGE_DIM = 8000
+# Claude API: images are auto-resized so the long edge ≤ 1568px.  For a
+# standard reMarkable page (1404×1872) this is fine — width stays ~1175px.
+# But for very tall scrollable pages (e.g. 1404×10000) the width shrinks to
+# ~220px, making text unreadable.  We tile tall pages so each chunk keeps
+# enough width to remain legible after the API's auto-resize.
+API_LONG_EDGE = 1568
+MIN_READABLE_WIDTH = 800  # if API resize would push width below this, tile
 
 
-def _svg_to_png(svg_path: Path) -> bytes:
-    """Convert an SVG file to PNG bytes using cairosvg. Scales down if needed to fit API limits."""
+def _svg_to_png(svg_path: Path) -> list[bytes]:
+    """Convert an SVG file to PNG byte chunks using cairosvg.
+
+    For tall SVGs where API auto-resize would shrink the width below
+    MIN_READABLE_WIDTH, the image is split into vertical tiles sized so
+    that each tile's width stays readable after resize.
+    Returns a list of PNG byte strings (one per tile).
+    """
     import cairosvg
+    from PIL import Image
 
-    # Read SVG to check dimensions
     svg_text = svg_path.read_text()
     match = re.search(r'height="(\d+)"', svg_text)
     svg_height = int(match.group(1)) if match else RM_HEIGHT
     match = re.search(r'width="(\d+)"', svg_text)
     svg_width = int(match.group(1)) if match else RM_WIDTH
 
-    # Scale down if either dimension exceeds API max (8000px)
-    output_width = svg_width
-    if svg_height > MAX_IMAGE_DIM or svg_width > MAX_IMAGE_DIM:
-        scale = min(MAX_IMAGE_DIM / svg_height, MAX_IMAGE_DIM / svg_width)
-        output_width = int(svg_width * scale)
+    # What would the API do with this image?  It resizes so long_edge ≤ 1568.
+    long_edge = max(svg_width, svg_height)
+    if long_edge <= API_LONG_EDGE:
+        # Fits as-is, no resize needed
+        result = cairosvg.svg2png(url=str(svg_path), output_width=svg_width)
+        assert isinstance(result, bytes)
+        return [result]
 
-    result = cairosvg.svg2png(url=str(svg_path), output_width=output_width)
-    assert isinstance(result, bytes)
-    return result
+    api_scale = API_LONG_EDGE / long_edge
+    api_width = svg_width * api_scale
+
+    if api_width >= MIN_READABLE_WIDTH:
+        # API resize keeps width readable — send as single image
+        result = cairosvg.svg2png(url=str(svg_path), output_width=svg_width)
+        assert isinstance(result, bytes)
+        return [result]
+
+    # Width would be too narrow after API resize.  Tile so each chunk's
+    # long edge ≤ API_LONG_EDGE with width = svg_width (i.e. height ≤ API_LONG_EDGE).
+    tile_height = API_LONG_EDGE
+
+    # Render full-resolution PNG, then split into vertical tiles
+    full_png = cairosvg.svg2png(url=str(svg_path), output_width=svg_width, output_height=svg_height)
+    assert isinstance(full_png, bytes)
+
+    full_img = Image.open(io.BytesIO(full_png))
+    tiles = []
+    for y_offset in range(0, svg_height, tile_height):
+        box = (0, y_offset, svg_width, min(y_offset + tile_height, svg_height))
+        tile = full_img.crop(box)
+        buf = io.BytesIO()
+        tile.save(buf, format="PNG")
+        tiles.append(buf.getvalue())
+
+    return tiles
 
 
-def _encode_page_image(page_path: Path) -> tuple[str, str]:
-    """Encode a page file to base64 and return (data, media_type)."""
+def _svg_to_full_png(svg_path: Path) -> bytes:
+    """Convert SVG to a single full-resolution PNG, stitching tiles if needed."""
+    from PIL import Image
+    chunks = _svg_to_png(svg_path)
+    if len(chunks) == 1:
+        return chunks[0]
+    # Stitch tiles vertically
+    images = [Image.open(io.BytesIO(c)) for c in chunks]
+    total_height = sum(img.height for img in images)
+    width = images[0].width
+    stitched = Image.new("RGB", (width, total_height))
+    y = 0
+    for img in images:
+        stitched.paste(img, (0, y))
+        y += img.height
+    buf = io.BytesIO()
+    stitched.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _encode_page_image(page_path: Path) -> list[tuple[str, str]]:
+    """Encode a page file to base64. Returns list of (data, media_type) tuples.
+
+    For tall SVGs this may return multiple tiles to preserve resolution.
+    """
     suffix = page_path.suffix.lower()
     if suffix == ".svg":
-        png_data = _svg_to_png(page_path)
-        return base64.standard_b64encode(png_data).decode("utf-8"), "image/png"
+        png_chunks = _svg_to_png(page_path)
+        return [
+            (base64.standard_b64encode(chunk).decode("utf-8"), "image/png")
+            for chunk in png_chunks
+        ]
     elif suffix == ".png":
-        return base64.standard_b64encode(page_path.read_bytes()).decode("utf-8"), "image/png"
+        return [(base64.standard_b64encode(page_path.read_bytes()).decode("utf-8"), "image/png")]
     else:
-        return base64.standard_b64encode(page_path.read_bytes()).decode("utf-8"), "application/pdf"
+        return [(base64.standard_b64encode(page_path.read_bytes()).decode("utf-8"), "application/pdf")]
 
 
 SINGLE_PAGE_PROMPT = """Transcribe all handwritten text in this page to clean markdown.
@@ -679,15 +743,15 @@ Rules:
 
 def transcribe_page(client, page_path: Path, model: str, context: str = "", system_prompt: str | None = None) -> str:
     """Send a single page image to Claude for transcription. Returns markdown string."""
-    page_data, media_type = _encode_page_image(page_path)
+    page_tiles = _encode_page_image(page_path)
 
     prompt = system_prompt or SINGLE_PAGE_PROMPT
-    user_content: list[dict] = [
-        {
+    user_content: list[dict] = []
+    for page_data, media_type in page_tiles:
+        user_content.append({
             "type": "image",
             "source": {"type": "base64", "media_type": media_type, "data": page_data},
-        },
-    ]
+        })
     if context:
         user_content.append({"type": "text", "text": f"Context:\n{context}"})
 
@@ -704,11 +768,11 @@ def transcribe_pages(client, page_paths: list[Path], model: str) -> str:
     """Send page images (SVG/PNG) to Claude for transcription. Returns markdown string."""
     content = []
     for page_path in page_paths:
-        page_data, media_type = _encode_page_image(page_path)
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": page_data},
-        })
+        for page_data, media_type in _encode_page_image(page_path):
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": page_data},
+            })
 
     message = client.messages.create(
         model=model,
@@ -982,7 +1046,7 @@ def extract_diagram_crops(
         try:
             # Load the page as a PIL Image
             if page_path.suffix.lower() == ".svg":
-                png_data = _svg_to_png(page_path)
+                png_data = _svg_to_full_png(page_path)
                 img = Image.open(io.BytesIO(png_data))
             elif page_path.suffix.lower() == ".pdf":
                 import fitz  # PyMuPDF
@@ -1080,7 +1144,7 @@ def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path], c
                 saved.append(dest_name)
                 continue
             if suffix == ".svg":
-                png_data = _svg_to_png(page_path)
+                png_data = _svg_to_full_png(page_path)
                 (attachments / dest_name).write_bytes(png_data)
             elif suffix == ".pdf":
                 shutil.copy2(page_path, attachments / dest_name)
