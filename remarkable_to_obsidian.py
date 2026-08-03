@@ -101,6 +101,96 @@ RM_WIDTH = 1404
 RM_HEIGHT = 1872
 
 
+class ClaudeCLIClient:
+    """Drop-in replacement for the anthropic SDK client that shells out to the
+    Claude Code CLI (`claude -p`), authenticating via the local subscription
+    login instead of an API key or Vertex project (RM_BACKEND=claude-cli).
+
+    Supports the messages.create subset this script uses: system text plus user
+    content made of text / base64 image / base64 document blocks. Base64 blocks
+    are written to temp files that the CLI reads with its Read tool.
+    """
+
+    # Vertex-era vars must not leak into the spawned CLI or it will try the
+    # deprecated GCP route and 403.
+    _SCRUB_ENV = (
+        "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION",
+        "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    )
+    _EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+            "application/pdf": ".pdf"}
+
+    def __init__(self, claude_bin: str | None = None, timeout: int = 900):
+        self.claude_bin = claude_bin or os.environ.get("RM_CLAUDE_BIN") or shutil.which("claude")
+        if not self.claude_bin:
+            raise RuntimeError("claude CLI not found on PATH; install Claude Code or set RM_CLAUDE_BIN")
+        self.timeout = timeout
+        self.messages = self
+
+    @staticmethod
+    def _cli_model(model: str) -> str:
+        # SDK-style dated ids (claude-haiku-4-5-20241022) -> CLI ids (claude-haiku-4-5)
+        return re.sub(r"-20\d{6}$", "", model)
+
+    def create(self, *, model: str, max_tokens: int = 4096, system=None, messages=None, **_):
+        system_text = "\n\n".join(
+            b["text"] for b in (system or []) if isinstance(b, dict) and b.get("type") == "text"
+        )
+        texts: list[str] = []
+        attachments: list[tuple[bytes, str]] = []  # (data, media_type)
+        for msg in messages or []:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                texts.append(content)
+                continue
+            for block in content:
+                btype = block.get("type")
+                if btype == "text":
+                    texts.append(block["text"])
+                elif btype in ("image", "document") and block.get("source", {}).get("type") == "base64":
+                    src = block["source"]
+                    attachments.append((base64.standard_b64decode(src["data"]), src["media_type"]))
+
+        with tempfile.TemporaryDirectory(prefix="rm-ocr-") as tmp:
+            paths = []
+            for i, (data, media_type) in enumerate(attachments, 1):
+                p = Path(tmp) / f"input-{i:02d}{self._EXT.get(media_type, '.bin')}"
+                p.write_bytes(data)
+                paths.append(str(p))
+            parts = [system_text]
+            if paths:
+                parts.append(
+                    "Input files (read each with the Read tool, in this order, before responding):\n"
+                    + "\n".join(paths)
+                )
+            parts.extend(texts)
+            parts.append("Respond with the final output only — no preamble, no commentary on the files.")
+            prompt = "\n\n".join(p for p in parts if p)
+
+            env = {k: v for k, v in os.environ.items() if k not in self._SCRUB_ENV}
+            result = subprocess.run(
+                [self.claude_bin, "-p", prompt,
+                 "--output-format", "text",
+                 "--model", self._cli_model(model),
+                 "--allowedTools", "Read",
+                 "--settings", '{"disableAllHooks": true}'],
+                capture_output=True, text=True, timeout=self.timeout, env=env, cwd=tmp,
+            )
+        if result.returncode != 0:
+            raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {result.stderr.strip()[-500:]}")
+        out = result.stdout.strip()
+        if not out:
+            raise RuntimeError("claude CLI returned empty output")
+
+        class _Block:
+            def __init__(self, text): self.text = text
+
+        class _Message:
+            def __init__(self, text): self.content = [_Block(text)]
+
+        return _Message(out)
+
+
 def load_config() -> dict:
     """Load configuration from environment variables with defaults."""
     home = Path.home()
@@ -1791,8 +1881,11 @@ def main():
 
     client = None
     if not args.dry_run:
-        import anthropic
-        if os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1":
+        if os.environ.get("RM_BACKEND", "").lower() == "claude-cli":
+            client = ClaudeCLIClient()
+            log.info("Using Claude Code CLI backend (%s)", client.claude_bin)
+        elif os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1":
+            import anthropic
             from anthropic import AnthropicVertex
             project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
             if not project_id:
@@ -1803,6 +1896,7 @@ def main():
                 region=os.environ.get("CLOUD_ML_REGION", "europe-west1"),
             )
         else:
+            import anthropic
             client = anthropic.Anthropic()
 
     # Build note index for auto-linking (unless disabled)
