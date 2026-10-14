@@ -326,12 +326,13 @@ def list_notebooks(rmapi_bin: str, watch_path: str) -> list[dict]:
 
     watch_norm = watch_path.rstrip("/")
     paths = []
-    for line in result.stdout.strip().splitlines():
-        line = line.strip()
+    for line in result.stdout.splitlines():
+        line = line.lstrip().rstrip("\r")
         if not line.startswith("[f]"):
             continue
-        # Extract path: "[f] /path/to/notebook"
-        path = line[4:].strip()
+        # Extract path: "[f] /path/to/notebook". Keep trailing spaces: they
+        # are part of the name, and rmapi can't find the notebook without them.
+        path = line[4:].lstrip()
 
         # Skip trash
         if path.startswith("/trash/"):
