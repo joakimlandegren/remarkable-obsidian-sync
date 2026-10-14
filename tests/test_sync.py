@@ -135,6 +135,14 @@ def _mock_rmapi_find_stat(notebooks_by_path: dict[str, dict]):
         result = MagicMock()
         result.returncode = 0
 
+        if len(cmd) == 1:
+            # Batched shell session: one `stat "<path>"` per stdin line
+            out = ["ReMarkable Cloud API Shell"]
+            for line in kwargs["input"].splitlines():
+                meta = notebooks_by_path.get(line[len('stat "'):-1])
+                out.append(json.dumps(meta) if meta else "Error: file doesn't exist")
+            result.stdout = "\n".join(out) + "\n"
+            return result
         if cmd[1] == "find":
             # Return "[f] /path" lines for each notebook
             lines = [f"[f] {path}" for path in notebooks_by_path]
@@ -557,7 +565,8 @@ def test_sync_processes_new_notebook(tmp_path):
 
     mock_extract.assert_called_once()
     mock_write.assert_called_once()
-    assert state["new-1"] == {"version": 1, "path": "/New Notes", "name": "New Notes"}
+    assert state["new-1"] == {"version": 1, "path": "/New Notes", "name": "New Notes",
+                              "modified": "2025-01-20T09:00:00Z", "pdf_hash": hashlib.sha256(b"%PDF-1.4 fake").hexdigest()}
 
 
 def test_sync_incremental_pages(tmp_path):

@@ -191,6 +191,61 @@ class ClaudeCLIClient:
         return _Message(out)
 
 
+class HendrixClient:
+    """Anthropic SDK client pointed at a Hendrix AI Gateway model route
+    (RM_BACKEND=hendrix), e.g. self-hosted GLM-5.3 Flash.
+
+    The gateway speaks Anthropic Messages but rejects `document` blocks, so PDF
+    blocks are rendered to per-page PNG images first. Thinking is disabled and
+    any thinking blocks dropped so callers can keep reading `content[0].text`.
+    """
+
+    DEFAULT_URL = "https://hendrix-genai.spotify.net/taskforce/glm-5-3-flash"
+
+    def __init__(self):
+        import anthropic
+        api_key = os.environ.get("HENDRIX_API_KEY")
+        if not api_key:
+            raise RuntimeError("HENDRIX_API_KEY must be set for RM_BACKEND=hendrix")
+        self.base_url = os.environ.get("RM_HENDRIX_URL", self.DEFAULT_URL)
+        self._client = anthropic.Anthropic(base_url=self.base_url, api_key=api_key)
+        self.messages = self
+
+    @staticmethod
+    def _pdf_to_images(block: dict) -> list[dict]:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=base64.b64decode(block["source"]["data"]), filetype="pdf")
+        images = []
+        for page in doc:
+            png = page.get_pixmap(dpi=150).tobytes("png")
+            images.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png",
+                           "data": base64.standard_b64encode(png).decode("utf-8")},
+            })
+        return images
+
+    def create(self, *, messages, **kwargs):
+        converted = []
+        for msg in messages:
+            content = msg["content"]
+            if isinstance(content, list):
+                new_content = []
+                for block in content:
+                    if block.get("type") == "document":
+                        new_content.extend(self._pdf_to_images(block))
+                    else:
+                        new_content.append(block)
+                msg = {**msg, "content": new_content}
+            converted.append(msg)
+        # GLM reasons by default and can burn the whole max_tokens budget on
+        # long PDFs before emitting any text; OCR doesn't benefit from it.
+        kwargs.setdefault("thinking", {"type": "disabled"})
+        message = self._client.messages.create(messages=converted, **kwargs)
+        message.content = [b for b in message.content if getattr(b, "type", "") == "text"] or message.content
+        return message
+
+
 def load_config() -> dict:
     """Load configuration from environment variables with defaults."""
     home = Path.home()
@@ -223,6 +278,41 @@ def save_state(state_file: str, notebooks: dict) -> None:
     path.write_text(json.dumps({"notebooks": notebooks}, indent=2))
 
 
+def _batch_stat(rmapi_bin: str, paths: list[str]) -> list[dict | None]:
+    """Stat many paths in one rmapi shell session.
+
+    Each separate rmapi invocation re-authenticates and re-fetches the whole
+    document tree, and ~30 of those in a row get HTTP 429 from the reMarkable
+    cloud. The shell answers each `stat` with either a JSON object or an
+    `Error:` line, in order, so results map back to paths positionally.
+    """
+    if not paths:
+        return []
+    commands = "".join('stat "%s"\n' % p.replace('"', '\\"') for p in paths)
+    result = subprocess.run([rmapi_bin], input=commands, capture_output=True, text=True)
+    decoder = json.JSONDecoder()
+    out, pos, results = result.stdout, 0, []
+    while len(results) < len(paths):
+        brace = out.find("{", pos)
+        err = out.find("Error:", pos)
+        if brace == -1 and err == -1:
+            break
+        if err != -1 and (brace == -1 or err < brace):
+            results.append(None)
+            pos = err + len("Error:")
+            continue
+        try:
+            meta, pos = decoder.raw_decode(out, brace)
+            results.append(meta)
+        except json.JSONDecodeError:
+            results.append(None)
+            pos = brace + 1
+    if len(results) < len(paths):
+        log.warning("rmapi batch stat returned %d/%d results: %s",
+                    len(results), len(paths), result.stderr.strip()[-300:])
+    return results + [None] * (len(paths) - len(results))
+
+
 def list_notebooks(rmapi_bin: str, watch_path: str) -> list[dict]:
     """List all notebooks under watch_path using rmapi find + stat."""
     # Always search from root so paths are absolute
@@ -234,8 +324,8 @@ def list_notebooks(rmapi_bin: str, watch_path: str) -> list[dict]:
         log.error("rmapi find failed (exit %d). Run `rmapi` to authenticate.", result.returncode)
         sys.exit(1)
 
-    notebooks = []
     watch_norm = watch_path.rstrip("/")
+    paths = []
     for line in result.stdout.strip().splitlines():
         line = line.strip()
         if not line.startswith("[f]"):
@@ -251,20 +341,12 @@ def list_notebooks(rmapi_bin: str, watch_path: str) -> list[dict]:
         if watch_norm != "" and watch_norm != "/":
             if path != watch_norm and not path.startswith(watch_norm + "/"):
                 continue
+        paths.append(path)
 
-        # Get metadata via stat
-        stat_result = subprocess.run(
-            [rmapi_bin, "stat", path],
-            capture_output=True, text=True,
-        )
-        if stat_result.returncode != 0:
+    notebooks = []
+    for path, meta in zip(paths, _batch_stat(rmapi_bin, paths)):
+        if meta is None:
             log.warning("Failed to stat %s, skipping", path)
-            continue
-
-        try:
-            meta = json.loads(stat_result.stdout)
-        except json.JSONDecodeError:
-            log.warning("Failed to parse stat output for %s, skipping", path)
             continue
 
         notebooks.append({
@@ -1466,6 +1548,17 @@ def sync_notebooks(
             summary.results.append(SyncResult(nb["name"], nb["path"], "skipped", "unchanged"))
             continue
 
+        # Version is often stuck at 0, so also skip when the modified time is
+        # unchanged since a successful sync. Saves an export per notebook,
+        # which otherwise trips reMarkable cloud rate limits (HTTP 429).
+        if (nb.get("modified") and nb_state.get("modified") == nb["modified"]
+                and ("pages" in nb_state or "pdf_hash" in nb_state)):
+            state[nb["id"]] = {**nb_state, "path": nb["path"], "name": nb["name"]}
+            save_state(state_file, state)
+            log.info("Skipping %s (unchanged, modified %s)", nb["name"], nb["modified"])
+            summary.results.append(SyncResult(nb["name"], nb["path"], "skipped", "unchanged"))
+            continue
+
         # A2: Resolve custom prompt for this notebook
         nb_prompt = None
         if custom_prompts:
@@ -1494,6 +1587,14 @@ def sync_notebooks(
                 # if available; the annotations PDF is a tiny stub for uploaded PDFs
                 original_pdf = tmp_dir / "original.pdf"
                 source_pdfs = [original_pdf] if original_pdf.exists() else pdfs
+                # Version is often stuck at 0, so compare content hashes too
+                pdf_hash = _hash_file(pdfs[0])
+                if nb_state.get("pdf_hash") == pdf_hash:
+                    log.info("Skipping %s (PDF content unchanged)", nb["name"])
+                    state[nb["id"]] = {**nb_state, "version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified")}
+                    save_state(state_file, state)
+                    summary.results.append(SyncResult(nb["name"], nb["path"], "skipped", "PDF content unchanged"))
+                    continue
                 if dry_run:
                     log.info("[DRY RUN] Would transcribe %s (PDF, %d bytes)", nb["name"], pdfs[0].stat().st_size)
                     summary.results.append(SyncResult(nb["name"], nb["path"], "dry_run", "PDF"))
@@ -1520,7 +1621,7 @@ def sync_notebooks(
                 nb["page_count"] = len(source_pdfs)
                 note_path = write_obsidian_note(vault_path, nb, markdown, source_files, tasks=tasks)
                 log.info("Wrote %s (%d chars)", note_path, len(markdown))
-                state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"]}
+                state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pdf_hash": pdf_hash}
                 save_state(state_file, state)
                 summary.results.append(SyncResult(nb["name"], nb["path"], "synced", f"{len(pdfs)} PDF pages"))
                 continue
@@ -1547,7 +1648,7 @@ def sync_notebooks(
 
             if not changed_indices and not removed:
                 log.info("Skipping %s (no page content changed)", nb["name"])
-                state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "pages": cached_pages}
+                state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pages": cached_pages}
                 save_state(state_file, state)
                 summary.results.append(SyncResult(nb["name"], nb["path"], "skipped", "no page content changed"))
                 continue
@@ -1626,7 +1727,7 @@ def sync_notebooks(
                     "hash": page_hashes[str(i)],
                     "markdown": page_markdowns[str(i)],
                 }
-            state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "pages": new_pages}
+            state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pages": new_pages}
             save_state(state_file, state)
         except Exception as exc:
             log.error("Failed to process %s", nb["name"], exc_info=True)
@@ -1948,6 +2049,9 @@ def main():
         if os.environ.get("RM_BACKEND", "").lower() == "claude-cli":
             client = ClaudeCLIClient()
             log.info("Using Claude Code CLI backend (%s)", client.claude_bin)
+        elif os.environ.get("RM_BACKEND", "").lower() == "hendrix":
+            client = HendrixClient()
+            log.info("Using Hendrix AI Gateway backend (%s)", client.base_url)
         elif os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1":
             import anthropic
             from anthropic import AnthropicVertex
