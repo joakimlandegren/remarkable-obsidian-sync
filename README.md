@@ -17,7 +17,7 @@ Sync handwritten [reMarkable](https://remarkable.com/) notebooks to [Obsidian](h
 - **Python 3.12+**
 - **[uv](https://docs.astral.sh/uv/)** for dependency management
 - **[rmapi](https://github.com/ddvk/rmapi)** for reMarkable cloud access (Go binary)
-- **An Anthropic API key** or **Google Cloud Vertex AI** access
+- **A model backend**: Spotify's Hendrix AI Gateway (GLM, recommended), the Claude Code CLI, an Anthropic API key, or Google Cloud Vertex AI. See [Backends](#backends).
 
 ### Install rmapi
 
@@ -53,14 +53,25 @@ Create a `.env` file in the project root (gitignored). The script loads it autom
 RMAPI_BIN=/path/to/rmapi
 OBSIDIAN_VAULT=/path/to/your/obsidian/vault
 
-# For Vertex AI (preferred)
-CLAUDE_CODE_USE_VERTEX=1
-ANTHROPIC_VERTEX_PROJECT_ID=your-gcp-project-id
-CLOUD_ML_REGION=europe-west1
-
-# Or for direct Anthropic API
-# ANTHROPIC_API_KEY=sk-ant-...
+# Self-hosted GLM via the Hendrix AI Gateway (recommended)
+RM_BACKEND=hendrix
+RM_MODEL=glm-5-3-flash
 ```
+
+### Backends
+
+`RM_BACKEND` selects where transcription requests go. All backends speak the Anthropic Messages format, so the rest of the pipeline is identical.
+
+| Backend | Setting | Auth | Notes |
+|---|---|---|---|
+| Hendrix AI Gateway | `RM_BACKEND=hendrix` | `HENDRIX_API_KEY` | Self-hosted GLM on Spotify compute. Far cheaper than Claude for OCR. |
+| Claude Code CLI | `RM_BACKEND=claude-cli` | Local `claude` login | Shells out to `claude -p` per request. Each call starts a full session, which is expensive at volume. |
+| Vertex AI | `CLAUDE_CODE_USE_VERTEX=1` | GCP credentials | Requires `ANTHROPIC_VERTEX_PROJECT_ID`. |
+| Anthropic API | *(default)* | `ANTHROPIC_API_KEY` | |
+
+**Hendrix / GLM details.** Use `glm-5-3-flash`: plain `glm-5-3` can't read images. The gateway rejects PDF `document` blocks, so the client renders each PDF page to a PNG (150 dpi, via PyMuPDF) before sending. Thinking is disabled because GLM otherwise spends the whole `max_tokens` budget reasoning on long PDFs and returns no text. The gateway is internal, so runs off VPN fail with a DNS error; those notebooks keep their old state and are retried on the next run.
+
+`sync.sh` reads `HENDRIX_API_KEY` from `~/.zshrc` because launchd doesn't load your shell profile.
 
 All configuration variables can also be set as environment variables:
 
@@ -69,8 +80,11 @@ All configuration variables can also be set as environment variables:
 | `OBSIDIAN_VAULT` | `~/obsidian-vault` | Path to your Obsidian vault |
 | `RMAPI_BIN` | `rmapi` | Path to the rmapi binary |
 | `RM_WATCH_PATH` | `/` | reMarkable folder to sync (e.g., `/Work/Notes`) |
-| `RM_MODEL` | `claude-opus-4-6` | Claude model to use for transcription |
+| `RM_BACKEND` | *(unset)* | `hendrix` or `claude-cli`; see [Backends](#backends) |
+| `RM_MODEL` | `claude-opus-4-6` | Model to use for transcription (`glm-5-3-flash` for Hendrix) |
 | `RM_STATE_FILE` | `~/.remarkable_sync_state.json` | Path to the sync state file |
+| `HENDRIX_API_KEY` | *(required for Hendrix)* | Hendrix AI Gateway key |
+| `RM_HENDRIX_URL` | `https://hendrix-genai.spotify.net/taskforce/glm-5-3-flash` | Gateway route for the Hendrix backend |
 | `ANTHROPIC_API_KEY` | *(required unless using Vertex)* | Your Anthropic API key |
 | `CLAUDE_CODE_USE_VERTEX` | *(unset)* | Set to `1` to use Vertex AI instead |
 | `ANTHROPIC_VERTEX_PROJECT_ID` | *(required for Vertex)* | GCP project ID |
@@ -187,9 +201,14 @@ The original cropped PNG is always kept as a fallback in `Attachments/reMarkable
 
 The tool tracks sync state per-page using SHA-256 hashes of the raw `.rm` stroke files. On subsequent runs:
 
-- **Unchanged notebook version**: Skipped entirely (no download)
-- **Changed version, unchanged pages**: Downloads but reuses cached transcriptions (no API calls)
-- **Changed pages only**: Only sends modified pages to Claude
+- **Unchanged notebook version or modified time**: Skipped entirely (no download). The reMarkable cloud often reports version `0` forever, so the `ModifiedClient` timestamp from the last successful sync is the main check.
+- **Changed, but unchanged pages**: Downloads but reuses cached transcriptions (no API calls)
+- **Changed pages only**: Only sends modified pages to the model
+- **PDF notebooks**: No per-page tracking; a SHA-256 of the exported PDF is stored and the notebook is re-transcribed only when it changes
+
+Notebook metadata is fetched with one rmapi shell session for all `stat` calls. Every separate rmapi invocation re-authenticates and refetches the document tree, and about 30 in a row get HTTP 429 from the reMarkable cloud.
+
+Notebooks with a `/` in their name can't be addressed by path through rmapi and are skipped; rename them on the device.
 
 This minimizes API usage and sync time.
 
