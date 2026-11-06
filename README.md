@@ -29,12 +29,21 @@ brew install rmapi
 go install github.com/ddvk/rmapi@latest
 ```
 
-Then authenticate:
+Then explicitly select a known-working binary and authenticate with that same
+binary, rather than relying on whichever `rmapi` is first on PATH:
 
 ```bash
-rmapi
+export RMAPI_BIN=/absolute/path/to/working/rmapi
+"$RMAPI_BIN"
 # Follow the one-time device code auth flow
 ```
+
+On Joakim's Mac, the working path is
+`/Users/joakiml/Code/remarkable-obsidian-sync/bin/rmapi`. The older
+`~/go/bin/rmapi` has returned HTTP 400 from the cloud API in this setup; use the
+project-local binary instead of repeatedly signing in with the old copy.
+Configure the same path in `.env` for sync. This binary is installed locally,
+not bundled in the Git repository.
 
 ## Setup
 
@@ -50,7 +59,7 @@ Create a `.env` file in the project root (gitignored). The script loads it autom
 
 ```bash
 # .env
-RMAPI_BIN=/path/to/rmapi
+RMAPI_BIN=/absolute/path/to/working/rmapi
 OBSIDIAN_VAULT=/path/to/your/obsidian/vault
 
 # Self-hosted GLM via the Hendrix AI Gateway (recommended)

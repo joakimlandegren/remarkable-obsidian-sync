@@ -16,10 +16,10 @@ The file path is relative to the vault root, without `.md` extension, and URL-en
 
 ## Prerequisites
 
-- `rmapi` — reMarkable cloud CLI. Set `RMAPI_BIN` to its path (e.g. `~/go/bin/rmapi`). **May not be on PATH** — always set `RMAPI_BIN` explicitly.
+- `rmapi` — reMarkable cloud CLI. On Joakim's Mac, set `RMAPI_BIN=/Users/joakiml/Code/remarkable-obsidian-sync/bin/rmapi`. The older `~/go/bin/rmapi` has returned HTTP 400 from the cloud API in this setup; do not recommend that copy for authentication or sync. On other machines, explicitly configure a known-working binary.
 - `uv` — Python package manager. Install with `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 - `cairo` — Required by `cairosvg` for SVG-to-PNG. Install with `brew install cairo`.
-- Authenticate rmapi first: run `rmapi` interactively to complete the one-time device registration.
+- Authenticate using the same binary configured in `RMAPI_BIN`. On Joakim's Mac, run `/Users/joakiml/Code/remarkable-obsidian-sync/bin/rmapi` interactively to complete device registration; do not use a different copy found on PATH.
 - **gcloud ADC** — Required for Vertex AI. Run `gcloud auth application-default login` if you get `invalid_grant` errors.
 
 ## Configuration
@@ -28,7 +28,7 @@ Create a `.env` file in the project root (gitignored). The script loads it autom
 
 ```bash
 # .env
-RMAPI_BIN=/path/to/rmapi
+RMAPI_BIN=/Users/joakiml/Code/remarkable-obsidian-sync/bin/rmapi
 OBSIDIAN_VAULT=/path/to/your/obsidian/vault
 
 # For Vertex AI (preferred)
@@ -55,7 +55,8 @@ Use `--dry-run` to preview without writing files. Use `RM_WATCH_PATH="/folder"` 
 | `FileNotFoundError: 'rmapi'` | `RMAPI_BIN` not set | Set `RMAPI_BIN` in `.env` |
 | `PermissionDeniedError: 403` on Vertex | Wrong GCP project ID | Check `ANTHROPIC_VERTEX_PROJECT_ID` in `.env` |
 | `invalid_grant` | ADC credentials expired | Run `gcloud auth application-default login` |
-| `rmapi` auth failure | Device not registered | Run `rmapi` interactively once to register |
+| HTTP 400 from the reMarkable cloud API | An older rmapi binary may be in use | In this setup, avoid `~/go/bin/rmapi`; set `RMAPI_BIN` to the known-working `/Users/joakiml/Code/remarkable-obsidian-sync/bin/rmapi` |
+| `rmapi` auth failure | Device not registered | Run `/Users/joakiml/Code/remarkable-obsidian-sync/bin/rmapi` interactively; on other machines, use the same known-working binary configured in `RMAPI_BIN` |
 | Notes not in iCloud vault | `OBSIDIAN_VAULT` not set | Set `OBSIDIAN_VAULT` in `.env` to iCloud path |
 
 ### Parallel batch sync
