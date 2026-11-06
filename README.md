@@ -98,6 +98,11 @@ All configuration variables can also be set as environment variables:
 uv run python remarkable_to_obsidian.py --dry-run
 ```
 
+Preview lists candidate notebooks without downloading pages, calling models,
+moving notes or writing notes, attachments, logs or state (including in-memory
+state). It does not estimate changed-page counts. Combining `--dry-run` with
+`--retag`, `--merge-states` or `--list-only` is rejected before any writes.
+
 ### Full sync
 
 ```bash
@@ -184,9 +189,15 @@ Each note includes:
 - Transcribed markdown content
 - Embedded handwritten source images at the bottom
 
-Source page images are saved to `<vault>/Attachments/reMarkable/`.
+Source page images are saved to `<vault>/Attachments/reMarkable/`. New source
+and diagram filenames use the notebook ID and content hashes, not the display
+name. Same-named notebooks remain separate; renames retain valid references.
+Old attachments are retained, not deleted or renamed. Partial updates supply
+unchanged-page images too, including diagram sources from cached transcription.
 
 A rolling sync log is maintained at `<vault>/Remarkable Notes/Sync Log.md` (newest first, max 10 entries).
+If a notebook or other non-log note already occupies that path, logging reports
+a conflict and leaves it untouched; it does not select another output path.
 
 ### Diagram conversion
 
@@ -211,6 +222,33 @@ Notebook metadata is fetched with one rmapi shell session for all `stat` calls. 
 Notebooks with a `/` in their name can't be addressed by path through rmapi and are skipped; rename them on the device.
 
 This minimizes API usage and sync time.
+
+### Obsidian edits and first upgrade
+
+Successful syncs record a SHA-256 of the generated note in that notebook's
+state entry (`output_hash`). Before moving a note or regenerating any assets,
+sync checks the existing note against that hash. Any Obsidian edit—including
+custom frontmatter or completed tasks—produces a visible `Conflict` error.
+The original note and its assets stay untouched, and the new source version is
+not marked synced. An occupied rename destination is also a conflict.
+
+Existing notes without a recorded output hash are treated as conflicts even
+when they look generated. Sync never assumes a legacy note is safe to replace.
+To deliberately regenerate or migrate one notebook:
+
+1. Stop scheduled sync and back up the note, its attachments and the state file.
+2. Move the existing note outside `Remarkable Notes/` (including its old path
+   if the notebook was renamed). Keep its attachments in place for old embeds.
+3. Remove only that notebook ID's entry from `notebooks` in `RM_STATE_FILE`.
+4. Run sync again. A fresh note and ID-scoped assets will be generated; manually
+   copy any desired edits from the saved note. Later syncs protect those edits
+   by reporting conflicts again rather than merging them.
+
+There is no two-way sync or automatic merge. Content updates render all pages
+locally to supply complete assets; only changed pages need transcription calls.
+Run one sync process per notebook; this is not a concurrent-editor locking or
+crash-transaction system. Re-tagging a protected note also counts as an edit on
+the next content sync and requires the same deliberate resolution workflow.
 
 ## Automatic sync (macOS)
 
