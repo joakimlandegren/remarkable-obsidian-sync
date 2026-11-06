@@ -1104,6 +1104,7 @@ def extract_diagram_crops(
     notebook_name: str,
     client=None,
     model: str = "",
+    notebook_id: str = "",
 ) -> tuple[str, list[str]]:
     """Find Diagram markers in markdown, convert to Mermaid/Excalidraw, return updated markdown and saved filenames."""
     from PIL import Image
@@ -1159,7 +1160,10 @@ def extract_diagram_crops(
             cropped.save(buf, "PNG")
             crop_bytes = buf.getvalue()
 
-            crop_name = f"{safe_name} - diagram {crop_counter}.png"
+            # ID isolates notebooks; content hash keeps older note assets intact.
+            asset_name = (f"rm-{notebook_id.encode().hex()}-{hashlib.sha256(crop_bytes).hexdigest()}"
+                          if notebook_id else safe_name)
+            crop_name = f"{asset_name} - diagram {crop_counter}.png"
             crop_path = attachments / crop_name
             crop_path.write_bytes(crop_bytes)
             saved_crops.append(crop_name)
@@ -1176,7 +1180,9 @@ def extract_diagram_crops(
                         log.info("Converted diagram %d to Mermaid", crop_counter)
                         return f"> *{description}*\n\n```mermaid\n{content}\n```"
                     elif fmt == "excalidraw" and content.strip():
-                        excalidraw_name = f"{safe_name} - diagram {crop_counter}.excalidraw.md"
+                        vector_name = (f"{asset_name}-{hashlib.sha256((description + content).encode()).hexdigest()}"
+                                       if notebook_id else safe_name)
+                        excalidraw_name = f"{vector_name} - diagram {crop_counter}.excalidraw.md"
                         excalidraw_path = attachments / excalidraw_name
                         _write_excalidraw_file(content, excalidraw_path, description)
                         saved_crops.append(excalidraw_name)
@@ -1204,9 +1210,8 @@ def sanitize_filename(name: str) -> str:
 def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path], changed_indices: set[int] | None = None) -> list[str]:
     """Save source page images to the vault Attachments folder. Returns list of filenames.
 
-    When *changed_indices* is provided, only pages whose index is in the set
-    are actually written to disk.  Filenames for unchanged pages are still
-    returned so the markdown note can embed all pages.
+    When *changed_indices* is provided, unchanged assets are reused if present;
+    missing assets are supplied too, so upgrades never emit dangling embeds.
     """
     attachments = Path(vault_path) / "Attachments" / "reMarkable"
     attachments.mkdir(parents=True, exist_ok=True)
@@ -1214,6 +1219,11 @@ def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path], c
     safe_name = sanitize_filename(notebook["name"])
     saved = []
     for i, page_path in enumerate(page_paths):
+        # Names do not depend on display names, which can collide or change.
+        if notebook.get("id"):
+            if page_path is None:
+                raise ValueError("Source page required to supply namespaced assets")
+            safe_name = f"rm-{notebook['id'].encode().hex()}-{_hash_file(page_path)}"
         # Determine the destination filename regardless of whether we write
         suffix = page_path.suffix.lower() if page_path else ".svg"
         if suffix == ".pdf":
@@ -1222,7 +1232,7 @@ def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path], c
             dest_name = f"{safe_name} - page {i+1}.png"
 
         # Only write to disk if this page changed (or no filter given)
-        if changed_indices is None or i in changed_indices:
+        if changed_indices is None or i in changed_indices or not (attachments / dest_name).exists():
             if page_path is None:
                 saved.append(dest_name)
                 continue
@@ -1262,6 +1272,8 @@ def _move_obsidian_note(vault_path: str, old_rm_path: str, old_name: str, notebo
         log.warning("Cannot move %s — old file not found", old_file)
         return
 
+    if new_file.exists():
+        raise ValueError(f"Conflict: move destination already exists: {new_file}")
     new_dir.mkdir(parents=True, exist_ok=True)
     old_file.rename(new_file)
     log.info("Moved %s → %s", old_file.relative_to(vault), new_file.relative_to(vault))
@@ -1308,7 +1320,17 @@ def _move_obsidian_note_legacy(vault_path: str, notebook: dict) -> None:
         log.warning("Multiple notes named %s found — skipping legacy move", safe_name)
 
 
-def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_files: list[str] | None = None, tasks: list[dict] | None = None) -> Path:
+def _note_path(vault_path: str, notebook: dict) -> Path:
+    parent = str(Path(notebook.get("path", "")).parent).lstrip("/")
+    return Path(vault_path) / "Remarkable Notes" / parent / f"{sanitize_filename(notebook['name'])}.md"
+
+
+def _check_note_output(path: Path, expected_hash: str | None) -> None:
+    if path.exists() and (not expected_hash or _hash_file(path) != expected_hash):
+        raise ValueError(f"Conflict: edited or legacy note preserved: {path}; move it outside Remarkable Notes and remove its state entry before regenerating")
+
+
+def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_files: list[str] | None = None, tasks: list[dict] | None = None, expected_hash: str | None = None) -> Path:
     """Write a markdown note with YAML frontmatter to the Obsidian vault inbox."""
     # Preserve reMarkable folder structure under Remarkable Notes/
     rm_path = notebook.get("path", "")
@@ -1366,6 +1388,7 @@ def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_f
             body += f"![[{fname}]]\n\n"
 
     note_path = inbox / filename
+    _check_note_output(note_path, expected_hash)
     note_path.write_text(frontmatter + body)
     return note_path
 
@@ -1523,20 +1546,44 @@ def sync_notebooks(
     """Process each notebook: skip unchanged, export, transcribe changed pages, write."""
     summary = SyncSummary()
     for nb in notebooks:
+        nb = dict(nb)
         nb_state = state.get(nb["id"], {})
 
         # Legacy state format migration: old format was {id: version}
         if not isinstance(nb_state, dict):
             nb_state = {}
 
+        # Preview exits before persistent mutations or model calls, including
+        # rename, legacy migration and unchanged-state refresh paths.
+        if dry_run:
+            log.info("[DRY RUN] Would check/sync %s (%s); no writes or model calls", nb["name"], nb["path"])
+            summary.results.append(SyncResult(nb["name"], nb["path"], "dry_run", "would check/sync notebook (no writes or model calls)"))
+            continue
+
+        # Check old note and occupied destinations before moves or asset writes.
+        # Legacy outputs are never adopted as a trusted baseline.
+        target = _note_path(vault_path, nb)
+        old_note = _note_path(vault_path, {**nb, "path": nb_state.get("path", nb["path"]),
+                                         "name": nb_state.get("name", nb["name"])})
+        try:
+            _check_note_output(old_note, nb_state.get("output_hash"))
+            if target != old_note:
+                _check_note_output(target, None)
+            if not nb_state.get("path"):
+                for legacy_note in (Path(vault_path) / "Remarkable Notes").rglob(f"{sanitize_filename(nb['name'])}.md"):
+                    ids = re.findall(r'^remarkable_id: *"?([^"\n]+)"? *$', legacy_note.read_text(), re.MULTILINE)
+                    if not ids or nb["id"] in ids:
+                        _check_note_output(legacy_note, None)
+        except ValueError as exc:
+            log.error("%s", exc)
+            summary.results.append(SyncResult(nb["name"], nb["path"], "errored", str(exc)))
+            continue
+
         # Detect path or name changes (notebook moved/renamed in reMarkable)
         old_path = nb_state.get("path")
         old_name = nb_state.get("name")
         if old_path and (old_path != nb["path"] or old_name != nb["name"]):
             _move_obsidian_note(vault_path, old_path, old_name or Path(old_path).name, nb)
-        elif not old_path and nb_state:
-            # Legacy state without stored path - search for existing note by name
-            _move_obsidian_note_legacy(vault_path, nb)
 
         if nb_state.get("version") == nb["version"] and nb["version"] != 0:
             # Update stored path/name even when skipping content sync.
@@ -1596,14 +1643,11 @@ def sync_notebooks(
                     save_state(state_file, state)
                     summary.results.append(SyncResult(nb["name"], nb["path"], "skipped", "PDF content unchanged"))
                     continue
-                if dry_run:
-                    log.info("[DRY RUN] Would transcribe %s (PDF, %d bytes)", nb["name"], pdfs[0].stat().st_size)
-                    summary.results.append(SyncResult(nb["name"], nb["path"], "dry_run", "PDF"))
-                    continue
+
                 # A1: Build context for PDF
                 pdf_context = f"Notebook: {nb['name']}\nPath: {nb.get('path', '')}"
                 markdown = transcribe_pdf(client, pdfs[0], model, context=pdf_context, system_prompt=nb_prompt)
-                markdown, _ = extract_diagram_crops(markdown, source_pdfs, vault_path, nb["name"], client=client, model=model)
+                markdown, _ = extract_diagram_crops(markdown, source_pdfs, vault_path, nb["name"], client=client, model=model, notebook_id=nb["id"])
                 if note_index:
                     markdown = autolink_markdown(markdown, note_index)
                 # B2: Extract tasks if enabled
@@ -1620,9 +1664,9 @@ def sync_notebooks(
                         nb["tags"] = list({*existing_tags, *inferred})
                 source_files = save_source_pages(vault_path, nb, source_pdfs)
                 nb["page_count"] = len(source_pdfs)
-                note_path = write_obsidian_note(vault_path, nb, markdown, source_files, tasks=tasks)
+                note_path = write_obsidian_note(vault_path, nb, markdown, source_files, tasks=tasks, expected_hash=nb_state.get("output_hash"))
                 log.info("Wrote %s (%d chars)", note_path, len(markdown))
-                state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pdf_hash": pdf_hash}
+                state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pdf_hash": pdf_hash, "output_hash": _hash_file(note_path)}
                 save_state(state_file, state)
                 summary.results.append(SyncResult(nb["name"], nb["path"], "synced", f"{len(pdfs)} PDF pages"))
                 continue
@@ -1649,24 +1693,18 @@ def sync_notebooks(
 
             if not changed_indices and not removed:
                 log.info("Skipping %s (no page content changed)", nb["name"])
-                state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pages": cached_pages}
+                state[nb["id"]] = {**nb_state, "version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pages": cached_pages}
                 save_state(state_file, state)
                 summary.results.append(SyncResult(nb["name"], nb["path"], "skipped", "no page content changed"))
                 continue
-
-            if dry_run:
-                log.info("[DRY RUN] Would transcribe %d/%d changed pages in %s",
-                         len(changed_indices), len(rm_pages), nb["name"])
-                summary.results.append(SyncResult(nb["name"], nb["path"], "dry_run", f"{len(changed_indices)}/{len(rm_pages)} pages changed"))
-                continue
-
-            # Render only changed pages to SVG (skip unchanged to save CPU)
-            svg_paths = [None] * len(rm_pages)
-            for i in changed_indices:
+            # Supply every source on upgrade/rename and for cached diagrams.
+            # Only changed pages are transcribed by the model.
+            svg_paths = []
+            for i in range(len(rm_pages)):
                 svg_content = _render_rm_to_svg(rm_pages[i])
                 svg_path = tmp_dir / f"page_{i+1}.svg"
                 svg_path.write_text(svg_content)
-                svg_paths[i] = svg_path
+                svg_paths.append(svg_path)
 
             # Transcribe only changed pages, reuse cached markdown for others
             page_markdowns = {}
@@ -1695,7 +1733,7 @@ def sync_notebooks(
             markdown = "\n\n---\n\n".join(all_parts)
 
             # Extract and crop any diagram regions
-            markdown, _ = extract_diagram_crops(markdown, svg_paths, vault_path, nb["name"], client=client, model=model)
+            markdown, _ = extract_diagram_crops(markdown, svg_paths, vault_path, nb["name"], client=client, model=model, notebook_id=nb["id"])
 
             if note_index:
                 markdown = autolink_markdown(markdown, note_index)
@@ -1716,7 +1754,7 @@ def sync_notebooks(
 
             source_files = save_source_pages(vault_path, nb, svg_paths, changed_indices=set(changed_indices))
             nb["page_count"] = len(rm_pages)
-            note_path = write_obsidian_note(vault_path, nb, markdown, source_files, tasks=tasks)
+            note_path = write_obsidian_note(vault_path, nb, markdown, source_files, tasks=tasks, expected_hash=nb_state.get("output_hash"))
             log.info("Wrote %s (%d chars, %d/%d pages transcribed)",
                      note_path, len(markdown), len(changed_indices), len(rm_pages))
             summary.results.append(SyncResult(nb["name"], nb["path"], "synced", f"{len(changed_indices)}/{len(rm_pages)} pages transcribed"))
@@ -1728,7 +1766,7 @@ def sync_notebooks(
                     "hash": page_hashes[str(i)],
                     "markdown": page_markdowns[str(i)],
                 }
-            state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pages": new_pages}
+            state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pages": new_pages, "output_hash": _hash_file(note_path)}
             save_state(state_file, state)
         except Exception as exc:
             log.error("Failed to process %s", nb["name"], exc_info=True)
@@ -1840,7 +1878,7 @@ def retag_notebooks(notebooks: list[dict], vault_path: str, rmapi_bin: str) -> N
     log.info("Retag complete: %d notes updated", updated)
 
 
-def write_sync_log(vault_path: str, summary: SyncSummary) -> Path:
+def write_sync_log(vault_path: str, summary: SyncSummary) -> Path | None:
     """Write/update a rolling sync log in the vault (newest first, max 10 entries)."""
     log_dir = Path(vault_path) / "Remarkable Notes"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1875,6 +1913,9 @@ def write_sync_log(vault_path: str, summary: SyncSummary) -> Path:
     existing_entries: list[str] = []
     if log_file.exists():
         content = log_file.read_text()
+        if not content.startswith("## Sync - "):
+            log.error("Conflict: sync log destination is not a generated log; preserved %s", log_file)
+            return None
         # Split on ## Sync - headings
         parts = re.split(r"(?=^## Sync - )", content, flags=re.MULTILINE)
         for part in parts:
@@ -1994,6 +2035,9 @@ def main():
     parser.add_argument("--infer-tags", action="store_true", help="Infer semantic tags from transcriptions using Haiku")
     args = parser.parse_args()
 
+    if args.dry_run and (args.merge_states or args.retag or args.list_only):
+        parser.error("--dry-run cannot be combined with --merge-states, --retag or --list-only")
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-7s  %(message)s",
@@ -2092,7 +2136,8 @@ def main():
     # Write sync log (skip for dry-run or empty results)
     if not args.dry_run and summary.results:
         log_path = write_sync_log(config["obsidian_vault"], summary)
-        log.info("Wrote sync log: %s", log_path)
+        if log_path is not None:
+            log.info("Wrote sync log: %s", log_path)
 
     log.info("Sync complete: %d synced, %d skipped, %d errors",
              len(summary.synced), len(summary.skipped), len(summary.errored))

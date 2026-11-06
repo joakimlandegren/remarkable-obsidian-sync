@@ -516,7 +516,7 @@ def test_sync_moves_renamed_notebook(tmp_path):
     notebooks = [
         {"id": "abc-123", "name": "My Note", "version": 3, "modified": "2025-01-15T10:30:00Z", "path": "/Archive/My Note"},
     ]
-    state = {"abc-123": {"version": 3, "path": "/Notes/My Note", "name": "My Note", "pages": {}}}
+    state = {"abc-123": {"version": 3, "path": "/Notes/My Note", "name": "My Note", "pages": {}, "output_hash": _hash_file(old_file)}}
 
     with patch("remarkable_to_obsidian._extract_rm_pages") as mock_extract, \
          patch("remarkable_to_obsidian.save_state"):
@@ -558,7 +558,7 @@ def test_sync_processes_new_notebook(tmp_path):
     fake_pdf.write_bytes(b"%PDF-1.4 fake")
 
     with patch("remarkable_to_obsidian._extract_rm_pages", return_value=None) as mock_extract, \
-         patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
+         patch("remarkable_to_obsidian.write_obsidian_note", wraps=write_obsidian_note) as mock_write, \
          patch("remarkable_to_obsidian.save_state"), \
          patch("tempfile.mkdtemp", return_value=str(tmp_path)):
         sync_notebooks(notebooks, state, str(tmp_path / "vault"), "rmapi", "claude-opus-4-6", dry_run=False, client=mock_client, state_file="/tmp/state.json")
@@ -566,7 +566,8 @@ def test_sync_processes_new_notebook(tmp_path):
     mock_extract.assert_called_once()
     mock_write.assert_called_once()
     assert state["new-1"] == {"version": 1, "path": "/New Notes", "name": "New Notes",
-                              "modified": "2025-01-20T09:00:00Z", "pdf_hash": hashlib.sha256(b"%PDF-1.4 fake").hexdigest()}
+                              "modified": "2025-01-20T09:00:00Z", "pdf_hash": hashlib.sha256(b"%PDF-1.4 fake").hexdigest(),
+                              "output_hash": state["new-1"]["output_hash"]}
 
 
 def test_sync_incremental_pages(tmp_path):
@@ -605,7 +606,7 @@ def test_sync_incremental_pages(tmp_path):
     with patch("remarkable_to_obsidian._extract_rm_pages", return_value=[rm1, rm2]), \
          patch("remarkable_to_obsidian._render_rm_to_svg", return_value='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1404 1872" width="1404" height="1872"><rect width="100%" height="100%" fill="white"/><path d="M 100 100 L 200 200" stroke="black"/></svg>') as mock_render, \
          patch("remarkable_to_obsidian.save_source_pages", return_value=[]) as mock_save, \
-         patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
+         patch("remarkable_to_obsidian.write_obsidian_note", wraps=write_obsidian_note) as mock_write, \
          patch("remarkable_to_obsidian.save_state"), \
          patch("tempfile.mkdtemp", return_value=str(tmp_path)):
         sync_notebooks(notebooks, state, str(tmp_path / "vault"), "rmapi", "claude-opus-4-6", dry_run=False, client=mock_client, state_file="/tmp/state.json")
@@ -619,9 +620,9 @@ def test_sync_incremental_pages(tmp_path):
     assert "# Page 1 cached" in written_md
     assert "# Page 2 updated" in written_md
 
-    # Only the changed page (index 1) should have been rendered to SVG
-    assert mock_render.call_count == 1
-    mock_render.assert_called_once_with(rm2)
+    # All source pages are supplied for safe asset migration and cached diagrams.
+    assert mock_render.call_count == 2
+    assert [call.args[0] for call in mock_render.call_args_list] == [rm1, rm2]
 
     # save_source_pages should receive changed_indices={1}
     mock_save.assert_called_once()
@@ -1520,7 +1521,7 @@ def test_sync_returns_summary(tmp_path):
     fake_pdf.write_bytes(b"%PDF-1.4")
 
     with patch("remarkable_to_obsidian._extract_rm_pages", return_value=None), \
-         patch("remarkable_to_obsidian.write_obsidian_note"), \
+         patch("remarkable_to_obsidian.write_obsidian_note", wraps=write_obsidian_note), \
          patch("remarkable_to_obsidian.save_state"), \
          patch("tempfile.mkdtemp", return_value=str(tmp_path)):
         result = sync_notebooks(
@@ -1730,7 +1731,7 @@ def test_sync_skips_blank_pages(tmp_path):
          patch("remarkable_to_obsidian._render_rm_to_svg", side_effect=mock_render), \
          patch("remarkable_to_obsidian._svg_to_png", return_value=[contrast_png]), \
          patch("remarkable_to_obsidian.save_source_pages", return_value=[]), \
-         patch("remarkable_to_obsidian.write_obsidian_note") as mock_write, \
+         patch("remarkable_to_obsidian.write_obsidian_note", wraps=write_obsidian_note) as mock_write, \
          patch("remarkable_to_obsidian.save_state"), \
          patch("tempfile.mkdtemp", return_value=str(tmp_path)):
         sync_notebooks(notebooks, state, str(tmp_path / "vault"), "rmapi", "claude-opus-4-6",
