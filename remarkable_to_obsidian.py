@@ -102,6 +102,203 @@ RM_WIDTH = 1404
 RM_HEIGHT = 1872
 
 
+class ProviderError(RuntimeError):
+    """A fixed diagnostic, never an upstream response or exception string."""
+
+
+def _quiet_provider_logs():
+    # SDK DEBUG logs contain request bodies; HTTP INFO logs contain URLs.
+    prefixes = ('anthropic', 'httpx', 'httpcore', 'google')
+    for name in (*prefixes, *tuple(logging.Logger.manager.loggerDict)):
+        if name.split('.')[0] in prefixes:
+            logger = logging.getLogger(name)
+            logger.disabled = True
+            logger.setLevel(logging.CRITICAL + 1)
+
+
+def _require_remote_consent():
+    if os.environ.get('RM_ALLOW_REMOTE_LLM') != '1':
+        raise ProviderError('Remote LLM denied; set RM_ALLOW_REMOTE_LLM=1 to consent')
+
+
+def _model_value(name, fallback=None):
+    value = os.environ.get(name, fallback)
+    if not isinstance(value, str) or not value or value.startswith('-') or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ProviderError('Invalid or missing model configuration')
+    return value
+
+
+def _endpoint(value, *, require_https=False):
+    """Validate without DNS, probing or normalization of an ambiguous authority."""
+    from urllib.parse import urlsplit
+    import ipaddress
+    try:
+        if not isinstance(value, str) or not value or any(ord(c) < 33 or ord(c) > 126 for c in value) or '\\' in value:
+            raise ValueError
+        url = urlsplit(value)
+        if url.scheme not in ('http', 'https') or not url.netloc or any(c in value for c in ('?', '#')):
+            raise ValueError
+        if '@' in url.netloc or '%' in url.netloc or url.username is not None:
+            raise ValueError
+        host = url.hostname
+        if not host or url.port == 0 or url.netloc.endswith(':'):
+            raise ValueError
+        local = host in ('127.0.0.1', '::1')
+        # Reject alternate loopback spellings rather than treating them as remote.
+        if not local:
+            if host.rstrip('.').lower() == 'localhost':
+                raise ValueError
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                if not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', host) or re.fullmatch(r'[0-9.xXa-fA-F]+', host):
+                    raise ValueError
+            else:
+                if address.is_loopback or address.version == 6 and address.ipv4_mapped:
+                    raise ValueError
+        if (require_https or not local) and url.scheme != 'https':
+            raise ValueError
+        return value.rstrip('/'), local
+    except (ValueError, TypeError):
+        raise ProviderError('Invalid endpoint configuration (strict URL/HTTPS required)') from None
+
+
+def resolve_provider_config():
+    backend = os.environ.get('RM_BACKEND')
+    legacy = os.environ.get('CLAUDE_CODE_USE_VERTEX')
+    if legacy not in (None, '', '0', '1'):
+        raise ProviderError('Invalid legacy provider selector')
+    if backend is None and legacy == '1':
+        backend = 'vertex'
+        log.warning('Legacy Vertex selector: migrate to RM_BACKEND=vertex')
+    if backend not in ('anthropic', 'vertex', 'hendrix', 'claude-cli', 'openai-compatible'):
+        raise ProviderError('RM_BACKEND must explicitly select a supported provider')
+    if legacy == '1' and backend != 'vertex' or legacy == '0' and backend == 'vertex':
+        raise ProviderError('Conflicting provider selectors')
+    model = _model_value('RM_MODEL')
+    config = {'backend': backend, 'model': model,
+              'task_model': _model_value('RM_TASK_MODEL', model),
+              'tag_model': _model_value('RM_TAG_MODEL', model),
+              'diagram_model': _model_value('RM_DIAGRAM_MODEL', model)}
+    # Vertex interpolates model IDs into a URL path, unlike JSON-based APIs.
+    if backend == 'vertex' and any(not re.fullmatch(r'[A-Za-z0-9._@-]+', config[key]) for key in ('model', 'task_model', 'tag_model', 'diagram_model')):
+        raise ProviderError('Invalid Vertex model identifier (URL path delimiters forbidden)')
+    if backend == 'openai-compatible':
+        endpoint, local = _endpoint(os.environ.get('RM_OPENAI_BASE_URL'))
+        config['base_url'] = endpoint
+        if not local:
+            _require_remote_consent()
+    else:
+        _require_remote_consent()
+    return config
+
+
+def _http_client():
+    import httpx
+    _quiet_provider_logs()
+    # No environment proxies or redirect forwarding, even with remote consent.
+    return httpx.Client(trust_env=False, follow_redirects=False, timeout=60.0)
+
+
+def create_client(config):
+    # Resolve again at the boundary: callers cannot bypass consent with a dict.
+    selected = resolve_provider_config()
+    if selected != config:
+        raise ProviderError('Provider configuration changed before client creation')
+    _quiet_provider_logs()
+    backend = config['backend']
+    try:
+        if backend == 'openai-compatible':
+            return OpenAICompatibleClient()
+        if backend == 'claude-cli':
+            return ClaudeCLIClient()
+        if backend == 'hendrix':
+            return HendrixClient()
+        import anthropic
+        if backend == 'vertex':
+            project = os.environ.get('ANTHROPIC_VERTEX_PROJECT_ID')
+            region = os.environ.get('CLOUD_ML_REGION', 'europe-west1')
+            if not project or not re.fullmatch(r'[a-z0-9-]+', project) or not re.fullmatch(r'[a-z0-9-]+', region):
+                raise ProviderError('Invalid Vertex project/region configuration')
+            default = 'https://aiplatform.googleapis.com/v1' if region == 'global' else f'https://{region}-aiplatform.googleapis.com/v1'
+            endpoint, _ = _endpoint(os.environ.get('ANTHROPIC_VERTEX_BASE_URL', default), require_https=True)
+            return anthropic.AnthropicVertex(project_id=project, region=region, base_url=endpoint,
+                                              http_client=_http_client(), max_retries=0, timeout=60.0)
+        endpoint, _ = _endpoint(os.environ.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), require_https=True)
+        return anthropic.Anthropic(base_url=endpoint, http_client=_http_client(), max_retries=0, timeout=60.0)
+    except ProviderError:
+        raise
+    except Exception:
+        raise ProviderError('Provider client initialization failed') from None
+
+
+def _text_message(text):
+    from types import SimpleNamespace
+    if not isinstance(text, str) or not text.strip():
+        raise ProviderError('Provider returned no usable text')
+    return SimpleNamespace(content=[SimpleNamespace(type='text', text=text)])
+
+
+class OpenAICompatibleClient:
+    """Only the chat-completions text/image subset used by this pipeline."""
+
+    def __init__(self):
+        config = resolve_provider_config()
+        if config['backend'] != 'openai-compatible':
+            raise ProviderError('OpenAI-compatible provider not selected')
+        self.base_url = config['base_url']
+        self._client = _http_client()
+        self.messages = self
+
+    def create(self, *, model, max_tokens, system=None, messages, **_):
+        try:
+            converted = []
+            if system:
+                text = system if isinstance(system, str) else '\n\n'.join(b['text'] for b in system if b['type'] == 'text')
+                converted.append({'role': 'system', 'content': text})
+            for message in messages:
+                role, content = message['role'], message['content']
+                if role not in ('user', 'assistant'):
+                    raise ProviderError('Unsupported message role')
+                if not isinstance(content, str):
+                    blocks = []
+                    for block in content:
+                        if block['type'] == 'text':
+                            blocks.append({'type': 'text', 'text': block['text']})
+                        elif block['type'] in ('image', 'document'):
+                            source = block['source']
+                            if source['type'] != 'base64':
+                                raise ProviderError('Unsupported attachment source')
+                            images = HendrixClient._pdf_to_images(block) if source['media_type'] == 'application/pdf' else [block]
+                            for image in images:
+                                source = image['source']
+                                if source['media_type'] not in ('image/png', 'image/jpeg', 'image/webp'):
+                                    raise ProviderError('Unsupported attachment media type')
+                                blocks.append({'type': 'image_url', 'image_url': {'url': f"data:{source['media_type']};base64,{source['data']}"}})
+                        else:
+                            raise ProviderError('Unsupported message block')
+                    content = blocks
+                converted.append({'role': role, 'content': content})
+            headers = {}
+            key = os.environ.get('RM_OPENAI_API_KEY')
+            if key:
+                headers['Authorization'] = 'Bearer ' + key
+            response = self._client.post(self.base_url + '/chat/completions',
+                                         json={'model': model, 'max_tokens': max_tokens, 'messages': converted}, headers=headers)
+            if not 200 <= response.status_code < 300:
+                raise ProviderError('Model HTTP request failed')
+            content = response.json()['choices'][0]['message']['content']
+            if isinstance(content, list):
+                if not content or any(not isinstance(b, dict) or b.get('type') != 'text' or not isinstance(b.get('text'), str) for b in content):
+                    raise ProviderError('Provider returned invalid text response')
+                content = '\n'.join(b['text'] for b in content)
+            return _text_message(content)
+        except ProviderError:
+            raise
+        except Exception:
+            raise ProviderError('Model request or response failed') from None
+
+
 class ClaudeCLIClient:
     """Drop-in replacement for the anthropic SDK client that shells out to the
     Claude Code CLI (`claude -p`), authenticating via the local subscription
@@ -117,11 +314,17 @@ class ClaudeCLIClient:
     _SCRUB_ENV = (
         "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION",
         "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
+        "HENDRIX_API_KEY", "RM_OPENAI_API_KEY", "RM_OPENAI_BASE_URL",
+        "RM_HENDRIX_URL", "GOOGLE_APPLICATION_CREDENTIALS",
     )
     _EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
             "application/pdf": ".pdf"}
 
     def __init__(self, claude_bin: str | None = None, timeout: int = 900):
+        _require_remote_consent()
+        _quiet_provider_logs()
         self.claude_bin = claude_bin or os.environ.get("RM_CLAUDE_BIN") or shutil.which("claude")
         if not self.claude_bin:
             raise RuntimeError("claude CLI not found on PATH; install Claude Code or set RM_CLAUDE_BIN")
@@ -130,16 +333,17 @@ class ClaudeCLIClient:
 
     @staticmethod
     def _cli_model(model: str) -> str:
-        # SDK-style dated ids (claude-haiku-4-5-20241022) -> CLI ids (claude-haiku-4-5)
-        return re.sub(r"-20\d{6}$", "", model)
+        # Model identifiers are opaque; unsupported identifiers fail at the CLI.
+        return model
 
     def create(self, *, model: str, max_tokens: int = 4096, system=None, messages=None, **_):
-        system_text = "\n\n".join(
+        system_text = system if isinstance(system, str) else "\n\n".join(
             b["text"] for b in (system or []) if isinstance(b, dict) and b.get("type") == "text"
         )
         texts: list[str] = []
         attachments: list[tuple[bytes, str]] = []  # (data, media_type)
         for msg in messages or []:
+            texts.append("ROLE: " + msg["role"])
             content = msg.get("content", "")
             if isinstance(content, str):
                 texts.append(content)
@@ -169,27 +373,20 @@ class ClaudeCLIClient:
             prompt = "\n\n".join(p for p in parts if p)
 
             env = {k: v for k, v in os.environ.items() if k not in self._SCRUB_ENV}
-            result = subprocess.run(
-                [self.claude_bin, "-p", prompt,
-                 "--output-format", "text",
-                 "--model", self._cli_model(model),
-                 "--allowedTools", "Read",
-                 "--settings", '{"disableAllHooks": true}'],
-                capture_output=True, text=True, timeout=self.timeout, env=env, cwd=tmp,
-            )
+            try:
+                result = subprocess.run(
+                    [self.claude_bin, "-p",
+                     "--output-format", "text",
+                     "--model", self._cli_model(model),
+                     "--allowedTools", "Read",
+                     "--settings", '{"disableAllHooks": true}'],
+                    input=prompt, capture_output=True, text=True, timeout=self.timeout, env=env, cwd=tmp,
+                )
+            except (subprocess.SubprocessError, OSError):
+                raise ProviderError("claude CLI execution failed or timed out") from None
         if result.returncode != 0:
-            raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {result.stderr.strip()[-500:]}")
-        out = result.stdout.strip()
-        if not out:
-            raise RuntimeError("claude CLI returned empty output")
-
-        class _Block:
-            def __init__(self, text): self.text = text
-
-        class _Message:
-            def __init__(self, text): self.content = [_Block(text)]
-
-        return _Message(out)
+            raise ProviderError(f"claude CLI failed (exit {result.returncode})")
+        return _text_message(result.stdout.strip())
 
 
 class HendrixClient:
@@ -204,12 +401,17 @@ class HendrixClient:
     DEFAULT_URL = "https://hendrix-genai.spotify.net/taskforce/glm-5-3-flash"
 
     def __init__(self):
+        _require_remote_consent()
+        _quiet_provider_logs()
         import anthropic
         api_key = os.environ.get("HENDRIX_API_KEY")
         if not api_key:
             raise RuntimeError("HENDRIX_API_KEY must be set for RM_BACKEND=hendrix")
-        self.base_url = os.environ.get("RM_HENDRIX_URL", self.DEFAULT_URL)
-        self._client = anthropic.Anthropic(base_url=self.base_url, api_key=api_key)
+        self.base_url, _ = _endpoint(os.environ.get("RM_HENDRIX_URL", self.DEFAULT_URL), require_https=True)
+        self._client = anthropic.Anthropic(base_url=self.base_url, api_key=api_key, auth_token="",
+                                           http_client=_http_client(), max_retries=0, timeout=60.0)
+        # Empty token prevents SDK environment inference; None omits Bearer entirely.
+        self._client.auth_token = None
         self.messages = self
 
     @staticmethod
@@ -309,8 +511,7 @@ def _batch_stat(rmapi_bin: str, paths: list[str]) -> list[dict | None]:
             results.append(None)
             pos = brace + 1
     if len(results) < len(paths):
-        log.warning("rmapi batch stat returned %d/%d results: %s",
-                    len(results), len(paths), result.stderr.strip()[-300:])
+        log.warning("rmapi batch stat returned %d/%d results", len(results), len(paths))
     return results + [None] * (len(paths) - len(results))
 
 
@@ -791,7 +992,7 @@ def export_notebook_pdf(rmapi_bin: str, notebook_path: str, name: str, output_di
         capture_output=True, text=True,
     )
     if result.returncode != 0:
-        log.error("Failed to export %s: %s", notebook_path, result.stderr)
+        log.error("rmapi export failed (exit %d)", result.returncode)
         return None
 
     pdf_path = output_dir / f"{name}.pdf"
@@ -1214,7 +1415,7 @@ def _convert_diagram_to_vector(client, crop_image: bytes, model: str) -> tuple[s
             valid, error = _validate_mermaid(content)
             if valid:
                 return "mermaid", content
-            log.warning("Mermaid validation failed (attempt %d): %s", attempt + 1, error)
+            log.warning("Mermaid validation failed (attempt %d)", attempt + 1)
             if attempt < 2:
                 # Add error feedback for retry
                 messages.append({"role": "assistant", "content": response})
@@ -1352,12 +1553,12 @@ def extract_diagram_crops(
                         return f"> *{description}*\n\n![[{excalidraw_name}]]"
                     # fallback_png: fall through to image embed
                 except Exception:
-                    log.warning("Failed to convert diagram %d to vector, using image", crop_counter, exc_info=True)
+                    log.warning("Failed to convert diagram %d to vector, using image", crop_counter)
 
             # Fallback: embed cropped image
             return f"> *{description}*\n\n![[{crop_name}]]"
         except Exception:
-            log.warning("Failed to crop diagram from page %d", page_num, exc_info=True)
+            log.warning("Failed to crop diagram from page %d", page_num)
             return match.group(0)
 
     updated_markdown = DIAGRAM_RE.sub(replace_diagram, markdown)
@@ -1621,11 +1822,9 @@ Return ONLY valid JSON, no explanation. If no tasks found, return [].
 
 Example: [{"text": "Send report to team", "assignee": "Alice", "due": "2026-03-15"}]"""
 
-TASK_MODEL = "claude-haiku-4-5-20241022"
-
-
-def extract_tasks(client, markdown: str, model: str = TASK_MODEL) -> list[dict]:
-    """Extract action items from markdown text using a lightweight model. Returns list of task dicts."""
+def extract_tasks(client, markdown: str, model: str | None = None) -> list[dict]:
+    """Extract action items using the selected provider and task model."""
+    model = model if model is not None else _model_value("RM_TASK_MODEL", os.environ.get("RM_MODEL"))
     message = client.messages.create(
         model=model,
         max_tokens=2048,
@@ -1673,8 +1872,9 @@ Tags should be short (1-2 words), use hyphens for multi-word tags.
 Example: ["meeting-notes", "strategy", "quarterly-planning", "finance"]"""
 
 
-def infer_tags(client, markdown: str, model: str = TASK_MODEL) -> list[str]:
-    """Infer semantic tags from markdown content using a lightweight model."""
+def infer_tags(client, markdown: str, model: str | None = None) -> list[str]:
+    """Infer semantic tags using the selected provider and tag model."""
+    model = model if model is not None else _model_value("RM_TAG_MODEL", os.environ.get("RM_MODEL"))
     message = client.messages.create(
         model=model,
         max_tokens=256,
@@ -1709,8 +1909,14 @@ def sync_notebooks(
     blank_detect: bool = True,
     custom_prompts: list[tuple[str, str]] | None = None,
     selection: Selection | None = None,
+    task_model: str | None = None,
+    tag_model: str | None = None,
+    diagram_model: str | None = None,
 ) -> SyncSummary:
     """Process each notebook: skip unchanged, export, transcribe changed pages, write."""
+    task_model = task_model if task_model is not None else model
+    tag_model = tag_model if tag_model is not None else model
+    diagram_model = diagram_model if diagram_model is not None else model
     summary = SyncSummary()
     for nb in notebooks:
         nb = dict(nb)
@@ -1746,8 +1952,9 @@ def sync_notebooks(
                     if not ids or nb["id"] in ids:
                         _check_note_output(legacy_note, None)
         except ValueError as exc:
-            log.error("%s", exc)
-            summary.results.append(SyncResult(nb["name"], nb["path"], "errored", str(exc)))
+            detail = "Conflict: managed note changed or destination occupied; preserved output"
+            log.error("%s", detail)
+            summary.results.append(SyncResult(nb["name"], nb["path"], "errored", detail))
             continue
 
         # Detect path or name changes (notebook moved/renamed in reMarkable)
@@ -1835,18 +2042,18 @@ def sync_notebooks(
                 # A1: Build context for PDF
                 pdf_context = f"Notebook: {nb['name']}\nPath: {nb.get('path', '')}"
                 markdown = transcribe_pdf(client, pdfs[0], model, context=pdf_context, system_prompt=nb_prompt)
-                markdown, _ = extract_diagram_crops(markdown, source_pdfs, vault_path, nb["name"], client=client, model=model, notebook_id=nb["id"])
+                markdown, _ = extract_diagram_crops(markdown, source_pdfs, vault_path, nb["name"], client=client, model=diagram_model, notebook_id=nb["id"])
                 if note_index:
                     markdown = autolink_markdown(markdown, note_index)
                 # B2: Extract tasks if enabled
                 tasks = None
                 if extract_tasks_enabled:
-                    tasks = extract_tasks(client, markdown)
+                    tasks = extract_tasks(client, markdown, task_model)
                     if tasks:
                         markdown = _inject_tasks(markdown, tasks)
                 # B3: Infer tags if enabled
                 if infer_tags_enabled:
-                    inferred = infer_tags(client, markdown)
+                    inferred = infer_tags(client, markdown, tag_model)
                     if inferred:
                         existing_tags = nb.get("tags", [])
                         nb["tags"] = list({*existing_tags, *inferred})
@@ -1940,7 +2147,7 @@ def sync_notebooks(
             markdown = "\n\n---\n\n".join(all_parts)
 
             # Extract and crop any diagram regions
-            markdown, _ = extract_diagram_crops(markdown, svg_paths, vault_path, nb["name"], client=client, model=model, notebook_id=nb["id"])
+            markdown, _ = extract_diagram_crops(markdown, svg_paths, vault_path, nb["name"], client=client, model=diagram_model, notebook_id=nb["id"])
 
             if note_index:
                 markdown = autolink_markdown(markdown, note_index)
@@ -1948,13 +2155,13 @@ def sync_notebooks(
             # B2: Extract tasks if enabled
             tasks = None
             if extract_tasks_enabled:
-                tasks = extract_tasks(client, markdown)
+                tasks = extract_tasks(client, markdown, task_model)
                 if tasks:
                     markdown = _inject_tasks(markdown, tasks)
 
             # B3: Infer tags if enabled
             if infer_tags_enabled:
-                inferred = infer_tags(client, markdown)
+                inferred = infer_tags(client, markdown, tag_model)
                 if inferred:
                     existing_tags = nb.get("tags", [])
                     nb["tags"] = list({*existing_tags, *inferred})
@@ -1979,8 +2186,8 @@ def sync_notebooks(
             state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pages": new_pages, "output_hash": _hash_file(note_path), **({"selection": selection_state} if selected_mode else {})}
             save_state(state_file, state)
         except Exception as exc:
-            log.error("Failed to process %s", nb["name"], exc_info=True)
-            summary.results.append(SyncResult(nb["name"], nb["path"], "errored", str(exc)))
+            log.error("Notebook processing failed; output/state not advanced")
+            summary.results.append(SyncResult(nb["name"], nb["path"], "errored", "Notebook processing failed"))
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -2114,7 +2321,8 @@ def write_sync_log(vault_path: str, summary: SyncSummary) -> Path | None:
     if summary.errored:
         lines.append("### Errors")
         for r in summary.errored:
-            lines.append(f"- {r.name} - {r.detail}")
+            detail = "Conflict: output preserved" if r.detail.startswith("Conflict:") else "Notebook processing failed"
+            lines.append(f"- {r.name} - {detail}")
         lines.append("")
 
     new_entry = "\n".join(lines)
@@ -2231,7 +2439,7 @@ def autolink_markdown(text: str, note_index: dict[str, str]) -> str:
     return text
 
 
-def main():
+def _main():
     parser = argparse.ArgumentParser(description="Sync reMarkable notebooks to Obsidian")
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing files")
     parser.add_argument("--list-only", metavar="FILE", help="List notebooks to JSON file and exit")
@@ -2241,8 +2449,8 @@ def main():
     parser.add_argument("--retag", action="store_true", help="Re-download notebooks to sync tags without re-transcribing")
     parser.add_argument("--no-autolink", action="store_true", help="Disable auto-linking of vault note names in transcriptions")
     parser.add_argument("--no-blank-detect", action="store_true", help="Disable blank page detection (skip API calls for empty pages)")
-    parser.add_argument("--extract-tasks", action="store_true", help="Extract action items from transcriptions using Haiku")
-    parser.add_argument("--infer-tags", action="store_true", help="Infer semantic tags from transcriptions using Haiku")
+    parser.add_argument("--extract-tasks", action="store_true", help="Extract action items using the configured task model")
+    parser.add_argument("--infer-tags", action="store_true", help="Infer semantic tags using the configured tag model")
     parser.add_argument("--include-tag", action="append", default=[], help="Include ANY native tag (repeatable)")
     parser.add_argument("--exclude-tag", action="append", default=[], help="Exclude native tag; wins over includes (repeatable)")
     parser.add_argument("--pages", type=parse_page_ranges, help="1-based pages/closed ranges, e.g. 1,3-5")
@@ -2270,6 +2478,11 @@ def main():
     if args.merge_states:
         merge_state_files(config["state_file"], args.merge_states)
         return
+
+    provider_config = None
+    if not (args.dry_run or args.list_only or args.retag):
+        provider_config = resolve_provider_config()
+        config.update(provider_config)
 
     state = load_state(config["state_file"])
 
@@ -2315,28 +2528,7 @@ def main():
         retag_notebooks(notebooks, config["obsidian_vault"], config["rmapi_bin"])
         return
 
-    client = None
-    if not args.dry_run:
-        if os.environ.get("RM_BACKEND", "").lower() == "claude-cli":
-            client = ClaudeCLIClient()
-            log.info("Using Claude Code CLI backend (%s)", client.claude_bin)
-        elif os.environ.get("RM_BACKEND", "").lower() == "hendrix":
-            client = HendrixClient()
-            log.info("Using Hendrix AI Gateway backend (%s)", client.base_url)
-        elif os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1":
-            import anthropic
-            from anthropic import AnthropicVertex
-            project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
-            if not project_id:
-                log.error("ANTHROPIC_VERTEX_PROJECT_ID must be set for Vertex AI")
-                sys.exit(1)
-            client = AnthropicVertex(
-                project_id=project_id,
-                region=os.environ.get("CLOUD_ML_REGION", "europe-west1"),
-            )
-        else:
-            import anthropic
-            client = anthropic.Anthropic()
+    client = create_client(provider_config) if provider_config is not None else None
 
     # Build note index for auto-linking (unless disabled)
     note_index = None
@@ -2358,6 +2550,9 @@ def main():
         blank_detect=not args.no_blank_detect,
         custom_prompts=custom_prompts or None,
         selection=selection,
+        task_model=config.get("task_model"),
+        tag_model=config.get("tag_model"),
+        diagram_model=config.get("diagram_model"),
     )
 
     # Write sync log (skip for dry-run or empty results)
@@ -2368,6 +2563,17 @@ def main():
 
     log.info("Sync complete: %d synced, %d skipped, %d errors",
              len(summary.synced), len(summary.skipped), len(summary.errored))
+
+
+def main():
+    try:
+        _main()
+    except ProviderError as exc:
+        log.error("%s", exc)
+        raise SystemExit(1) from None
+    except Exception:
+        log.error("Sync failed (operation failed; sensitive diagnostics omitted)")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

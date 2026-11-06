@@ -1903,7 +1903,7 @@ def test_extract_tasks_basic():
     mock_response.content = [MagicMock(text='[{"text": "Send report", "assignee": "Alice", "due": null}]')]
     mock_client.messages.create.return_value = mock_response
 
-    tasks = extract_tasks(mock_client, "# Meeting\n- Send report to Alice")
+    tasks = extract_tasks(mock_client, "# Meeting\n- Send report to Alice", "test-main")
     assert len(tasks) == 1
     assert tasks[0]["text"] == "Send report"
     assert tasks[0]["assignee"] == "Alice"
@@ -1916,7 +1916,7 @@ def test_extract_tasks_invalid_json():
     mock_response.content = [MagicMock(text="not valid json {{{")]
     mock_client.messages.create.return_value = mock_response
 
-    tasks = extract_tasks(mock_client, "some content")
+    tasks = extract_tasks(mock_client, "some content", "test-main")
     assert tasks == []
 
 
@@ -1954,7 +1954,7 @@ def test_infer_tags_basic():
     mock_response.content = [MagicMock(text='["meeting-notes", "strategy", "planning"]')]
     mock_client.messages.create.return_value = mock_response
 
-    tags = infer_tags(mock_client, "# Strategy Meeting\n- Discussed roadmap")
+    tags = infer_tags(mock_client, "# Strategy Meeting\n- Discussed roadmap", "test-main")
     assert len(tags) == 3
     assert "meeting-notes" in tags
     assert "strategy" in tags
@@ -1967,7 +1967,7 @@ def test_infer_tags_normalization():
     mock_response.content = [MagicMock(text='["Meeting Notes", "STRATEGY", "product design"]')]
     mock_client.messages.create.return_value = mock_response
 
-    tags = infer_tags(mock_client, "content")
+    tags = infer_tags(mock_client, "content", "test-main")
     assert "meeting-notes" in tags
     assert "strategy" in tags
     assert "product-design" in tags
@@ -1980,5 +1980,5 @@ def test_infer_tags_invalid_json():
     mock_response.content = [MagicMock(text="not json")]
     mock_client.messages.create.return_value = mock_response
 
-    tags = infer_tags(mock_client, "content")
+    tags = infer_tags(mock_client, "content", "test-main")
     assert tags == []

@@ -274,6 +274,8 @@ def test_main_log_cannot_overwrite_conflicted_notebook(tmp_path, monkeypatch, ca
     config = {"state_file": str(tmp_path / "state.json"), "obsidian_vault": vault,
               "rmapi_bin": "forbidden", "watch_path": "/", "model": "fake"}
     monkeypatch.setenv("RM_BACKEND", "claude-cli")
+    monkeypatch.setenv("RM_MODEL", "fake")
+    monkeypatch.setenv("RM_ALLOW_REMOTE_LLM", "1")
     with patch.object(sys, "argv", ["sync"]), \
          patch.object(app, "load_config", return_value=config), \
          patch.object(app, "load_state", return_value=state), \
