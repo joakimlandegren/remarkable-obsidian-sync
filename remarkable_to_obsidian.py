@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -498,6 +499,160 @@ def _render_rm_to_svg(rm_path: Path) -> str:
     return svg
 
 
+def parse_page_ranges(value: str) -> tuple[tuple[int, int], ...]:
+    """Parse closed 1-based ranges without expanding potentially huge intervals."""
+    ranges = []
+    for part in value.split(","):
+        match = re.fullmatch(r"\s*([0-9]+)(?:-([0-9]+))?\s*", part)
+        if not match:
+            raise ValueError("--pages requires 1-based numbers or closed ranges, e.g. 1,3-5")
+        start = int(match[1])
+        end = int(match[2] or match[1])
+        if start < 1 or end < start:
+            raise ValueError("--pages requires positive, non-reversed ranges")
+        ranges.append((start, end))
+    return tuple(ranges)
+
+
+@dataclass(frozen=True)
+class Selection:
+    include_tags: tuple[str, ...] = ()
+    exclude_tags: tuple[str, ...] = ()
+    pages: tuple[tuple[int, int], ...] = ()
+
+    def matches(self, number: int, tags: set[str]) -> bool:
+        normalize = lambda values: {v.strip().casefold() for v in values}
+        tags = normalize(tags)
+        include = normalize(self.include_tags)
+        exclude = normalize(self.exclude_tags)
+        return (not include or bool(include & tags)) and not (exclude & tags) and (
+            not self.pages or any(start <= number <= end for start, end in self.pages))
+
+
+def _native_selection_metadata(content: dict) -> tuple[list[str], list[set[str]]]:
+    """Resolve native order and tag associations; never infer ordering from files."""
+    if content.get("fileType", "notebook") not in ("notebook", ""):
+        raise ValueError("Unsupported selection: PDF/EPUB archive mapping is not supported")
+    deleted = set()
+    if "cPages" in content:
+        entries = content["cPages"]["pages"]
+        all_ids = [page["id"] for page in entries]
+        if any(not isinstance(pid, str) or not pid for pid in all_ids) or len(set(all_ids)) != len(all_ids):
+            raise ValueError("Unsupported selection: duplicate/malformed cPages page IDs")
+        live = []
+        for page in entries:
+            if page.get("deleted", {}).get("value") is True:
+                deleted.add(page["id"])
+            elif page.get("deleted", {}).get("value", False) is not False:
+                raise ValueError("Unsupported selection: ambiguous deleted page metadata")
+            else:
+                live.append(page)
+        ranks = [p.get("idx", {}).get("value") for p in live]
+        if any(not isinstance(rank, str) or not rank for rank in ranks) or len(set(ranks)) != len(ranks):
+            raise ValueError("Unsupported selection: missing/duplicate cPages ordering indices")
+        ids = [p["id"] for p in sorted(live, key=lambda p: p["idx"]["value"])]
+    else:
+        ids = content.get("pages")
+    if not isinstance(ids, list) or any(not isinstance(pid, str) or not pid for pid in ids) or len(set(ids)) != len(ids):
+        raise ValueError("Unsupported selection: missing/duplicate native page IDs")
+
+    def tag_names(values):
+        if not isinstance(values, list) or any(not isinstance(t, dict) or not isinstance(t.get("name"), str) for t in values):
+            raise ValueError("Unsupported selection: malformed native tags")
+        return {t["name"] for t in values}
+
+    notebook_tags = tag_names(content.get("tags", []))
+    tags = {pid: set(notebook_tags) for pid in ids}
+    page_tags = content.get("pageTags", [])
+    tag_names(page_tags)  # Validate even when no include filters were supplied.
+    for tag in page_tags:
+        pid = tag.get("pageId")
+        if pid in deleted:
+            continue
+        if pid not in tags:
+            raise ValueError("Unsupported selection: unknown/missing pageId in native pageTags")
+        tags[pid].add(tag["name"])
+    return ids, [tags[pid] for pid in ids]
+
+
+def _prepare_selected_pages(rmapi_bin: str, notebook_path: str, output: Path,
+                            selection: Selection) -> tuple[list[Path | None], list[str], list[str]]:
+    """Download locally, then expose only selected native strokes or PDF subsets."""
+    result = subprocess.run([rmapi_bin, "get", notebook_path], capture_output=True, text=True, cwd=str(output))
+    if result.returncode:
+        raise ValueError("Selection download failed")
+    archives = list(output.glob("*.zip")) + list(output.glob("*.rmdoc"))
+    pdfs = list(output.glob("*.pdf"))
+    pdf_metadata = None
+    if len(archives) == 1 and not pdfs:
+        with zipfile.ZipFile(archives[0]) as archive:
+            names = archive.namelist()
+            manifests = [name for name in names if name.endswith(".content")]
+            if len(manifests) != 1 or len(set(names)) != len(names):
+                raise ValueError("Unsupported selection: ambiguous archive metadata")
+            content = json.loads(archive.read(manifests[0]))
+            if content.get("fileType") == "pdf":
+                # ponytail: PDF archives with annotation/redirection metadata need a
+                # verified compositor before we can safely honor native page tags.
+                if selection.include_tags or selection.exclude_tags or any(name.endswith(".rm") for name in names) or "cPages" in content:
+                    raise ValueError("Unsupported selection: annotated/reordered/tag-filtered PDF archive")
+                pdf_metadata = content
+                originals = [name for name in names if name.lower().endswith(".pdf")]
+                if len(originals) != 1:
+                    raise ValueError("Unsupported selection: ambiguous PDF archive")
+                pdf = output / "original.pdf"
+                pdf.write_bytes(archive.read(originals[0]))
+                pdfs = [pdf]
+            else:
+                ids, tags = _native_selection_metadata(content)
+                paths = []
+                output_tags = set()
+                for i, pid in enumerate(ids):
+                    if not selection.matches(i + 1, tags[i]):
+                        paths.append(None)
+                        continue
+                    members = [name for name in names if Path(name).name == pid + ".rm"]
+                    if len(members) != 1:
+                        raise ValueError("Unsupported selection: missing/ambiguous native stroke page")
+                    page = output / f"selected-{i+1}.rm"
+                    page.write_bytes(archive.read(members[0]))
+                    paths.append(page)
+                    output_tags.update(tags[i])
+                return paths, ids, sorted(output_tags)
+    elif archives or len(pdfs) != 1:
+        raise ValueError("Unsupported selection: expected one native archive or ordinary PDF")
+    if selection.include_tags or selection.exclude_tags:
+        raise ValueError("Unsupported selection: native tags unavailable for ordinary PDF")
+    import fitz
+    with fitz.open(pdfs[0]) as document:
+        if pdf_metadata is not None:
+            count = len(document)
+            pages = pdf_metadata.get("pages", [])
+            mapping = pdf_metadata.get("redirectionPageMap", [])
+            if (pdf_metadata.get("pageCount", count) != count
+                    or pdf_metadata.get("originalPageCount", count) != count
+                    or (pages and (not isinstance(pages, list) or len(pages) != count
+                                  or any(not isinstance(pid, str) for pid in pages)
+                                  or len(set(pages)) != count))
+                    or ((pages or mapping) and (mapping != list(range(count))
+                                               or any(type(index) is not int for index in mapping)))):
+                raise ValueError("Unsupported selection: PDF archive needs explicit identity page mapping")
+        paths = []
+        # Page number is the stable identity available for an ordinary PDF. Hashes
+        # still invalidate cache when content at that number changes.
+        ids = [f"pdf:{i+1}" for i in range(len(document))]
+        for i in range(len(document)):
+            if not selection.matches(i + 1, set()):
+                paths.append(None)
+                continue
+            path = output / f"selected-{i+1}.pdf"
+            with fitz.open() as subset:
+                subset.insert_pdf(document, from_page=i, to_page=i)
+                subset.save(path, garbage=4, deflate=True, no_new_id=True)
+            paths.append(path)
+    return paths, ids, []
+
+
 def _extract_content_tags(zip_path: Path, notebook_path: str) -> None:
     """Extract pageTags from a .content file inside a zip/rmdoc and cache them."""
     try:
@@ -886,6 +1041,12 @@ DIAGRAM_TYPES: dict[str, str] = {
 }
 
 
+def _renumber_diagrams(markdown: str, page_number: int) -> str:
+    """Change only parsed marker page fields, never literal transcribed page= text."""
+    return DIAGRAM_RE.sub(lambda match: match[0].replace(
+        f"page={match[1]},", f"page={page_number},", 1), markdown)
+
+
 def _classify_diagram(client, crop_image: bytes, model: str) -> str:
     """Classify a diagram image into a category. Returns category string."""
     image_data = base64.standard_b64encode(crop_image).decode("utf-8")
@@ -1099,7 +1260,7 @@ def _write_excalidraw_file(elements_json: str, file_path: Path, description: str
 
 def extract_diagram_crops(
     markdown: str,
-    page_paths: list[Path],
+    page_paths: Sequence[Path | None],
     vault_path: str,
     notebook_name: str,
     client=None,
@@ -1127,6 +1288,7 @@ def extract_diagram_crops(
             return match.group(0)  # leave as-is if page out of range or not rendered
 
         page_path = page_paths[page_num - 1]
+        assert page_path is not None
         try:
             # Load the page as a PIL Image
             if page_path.suffix.lower() == ".svg":
@@ -1207,7 +1369,7 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9 _-]", "_", name)
 
 
-def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path], changed_indices: set[int] | None = None) -> list[str]:
+def save_source_pages(vault_path: str, notebook: dict, page_paths: Sequence[Path | None], changed_indices: set[int] | None = None) -> list[str]:
     """Save source page images to the vault Attachments folder. Returns list of filenames.
 
     When *changed_indices* is provided, unchanged assets are reused if present;
@@ -1219,6 +1381,8 @@ def save_source_pages(vault_path: str, notebook: dict, page_paths: list[Path], c
     safe_name = sanitize_filename(notebook["name"])
     saved = []
     for i, page_path in enumerate(page_paths):
+        if page_path is None and notebook.get("selected_pages"):
+            continue
         # Names do not depend on display names, which can collide or change.
         if notebook.get("id"):
             if page_path is None:
@@ -1361,6 +1525,8 @@ def write_obsidian_note(vault_path: str, notebook: dict, markdown: str, source_f
     page_count = notebook.get("page_count")
     if page_count is not None:
         lines.append(f"page_count: {page_count}")
+    if notebook.get("selected_pages"):
+        lines.append(f"selected_pages: {json.dumps(notebook['selected_pages'])}")
 
     # Merge hardcoded tags with reMarkable tags
     tags = ["handwritten", "inbox"]
@@ -1542,6 +1708,7 @@ def sync_notebooks(
     infer_tags_enabled: bool = False,
     blank_detect: bool = True,
     custom_prompts: list[tuple[str, str]] | None = None,
+    selection: Selection | None = None,
 ) -> SyncSummary:
     """Process each notebook: skip unchanged, export, transcribe changed pages, write."""
     summary = SyncSummary()
@@ -1553,11 +1720,15 @@ def sync_notebooks(
         if not isinstance(nb_state, dict):
             nb_state = {}
 
+        selected_mode = selection is not None or "selection" in nb_state
+
         # Preview exits before persistent mutations or model calls, including
         # rename, legacy migration and unchanged-state refresh paths.
         if dry_run:
-            log.info("[DRY RUN] Would check/sync %s (%s); no writes or model calls", nb["name"], nb["path"])
-            summary.results.append(SyncResult(nb["name"], nb["path"], "dry_run", "would check/sync notebook (no writes or model calls)"))
+            detail = ("selection unresolved: requires archive inspection; no downloads, model calls or writes"
+                      if selected_mode else "would check/sync notebook (no writes or model calls)")
+            log.info("[DRY RUN] %s (%s): %s", nb["name"], nb["path"], detail)
+            summary.results.append(SyncResult(nb["name"], nb["path"], "dry_run", detail))
             continue
 
         # Check old note and occupied destinations before moves or asset writes.
@@ -1582,10 +1753,10 @@ def sync_notebooks(
         # Detect path or name changes (notebook moved/renamed in reMarkable)
         old_path = nb_state.get("path")
         old_name = nb_state.get("name")
-        if old_path and (old_path != nb["path"] or old_name != nb["name"]):
+        if not selected_mode and old_path and (old_path != nb["path"] or old_name != nb["name"]):
             _move_obsidian_note(vault_path, old_path, old_name or Path(old_path).name, nb)
 
-        if nb_state.get("version") == nb["version"] and nb["version"] != 0:
+        if not selected_mode and nb_state.get("version") == nb["version"] and nb["version"] != 0:
             # Update stored path/name even when skipping content sync.
             # Skip the fast-path when version is 0 - the reMarkable API
             # sometimes never increments from 0, so we fall through to
@@ -1599,7 +1770,7 @@ def sync_notebooks(
         # Version is often stuck at 0, so also skip when the modified time is
         # unchanged since a successful sync. Saves an export per notebook,
         # which otherwise trips reMarkable cloud rate limits (HTTP 429).
-        if (nb.get("modified") and nb_state.get("modified") == nb["modified"]
+        if (not selected_mode and nb.get("modified") and nb_state.get("modified") == nb["modified"]
                 and ("pages" in nb_state or "pdf_hash" in nb_state)):
             state[nb["id"]] = {**nb_state, "path": nb["path"], "name": nb["name"]}
             save_state(state_file, state)
@@ -1618,10 +1789,27 @@ def sync_notebooks(
         tmp_dir = Path(tempfile.mkdtemp())
         try:
             # Extract raw .rm pages (returns None for PDF notebooks)
-            rm_pages = _extract_rm_pages(rmapi_bin, nb["path"], tmp_dir)
+            selection_state = None
+            page_ids = []
+            if selected_mode:
+                rm_pages, page_ids, native_tags = _prepare_selected_pages(
+                    rmapi_bin, nb["path"], tmp_dir, selection or Selection())
+                nb["tags"] = native_tags  # Never use stat/inferred/frontmatter tags as evidence.
+                selected_indices = [i for i, path in enumerate(rm_pages) if path is not None]
+                if not selected_indices:
+                    summary.results.append(SyncResult(nb["name"], nb["path"], "skipped", "no pages match selection; existing output retained"))
+                    continue
+                selection_state = {"ids": [page_ids[i] for i in selected_indices],
+                                   "numbers": selected_indices, "tags": native_tags,
+                                   "total": len(rm_pages)}
+                if old_path and (old_path != nb["path"] or old_name != nb["name"]):
+                    _move_obsidian_note(vault_path, old_path, old_name or Path(old_path).name, nb)
+            else:
+                rm_pages = _extract_rm_pages(rmapi_bin, nb["path"], tmp_dir)
+                selected_indices = list(range(len(rm_pages or [])))
 
             # Merge page tags from .content file (rmapi stat doesn't return these)
-            content_tags = _content_tags.pop(nb["path"], [])
+            content_tags = _content_tags.pop(nb["path"], []) if not selected_mode else []
             if content_tags:
                 existing = nb.get("tags", [])
                 nb["tags"] = list({*existing, *content_tags})
@@ -1676,14 +1864,21 @@ def sync_notebooks(
 
             # Per-page change detection
             cached_pages = nb_state.get("pages", {})
+            if selected_mode:
+                # Old context-bearing cache can contain information from excluded pages.
+                # Only our context-free page records can cross a selection boundary.
+                by_id = {page.get("id"): page for page in cached_pages.values() if page.get("context_free")}
+                cached_pages = {str(i): by_id.get(page_ids[i], {}) for i in selected_indices}
             page_hashes = {}
             changed_indices = []
 
-            for i, rm_file in enumerate(rm_pages):
+            for i in selected_indices:
+                rm_file = rm_pages[i]
+                assert rm_file is not None
                 h = _hash_file(rm_file)
                 page_hashes[str(i)] = h
                 cached = cached_pages.get(str(i), {})
-                if cached.get("hash") != h:
+                if cached.get("hash") != h or "markdown" not in cached:
                     changed_indices.append(i)
 
             # Detect removed pages
@@ -1691,7 +1886,7 @@ def sync_notebooks(
             old_count = len(cached_pages)
             removed = current_count < old_count
 
-            if not changed_indices and not removed:
+            if not changed_indices and not removed and (not selected_mode or nb_state.get("selection") == selection_state):
                 log.info("Skipping %s (no page content changed)", nb["name"])
                 state[nb["id"]] = {**nb_state, "version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pages": cached_pages}
                 save_state(state_file, state)
@@ -1699,37 +1894,49 @@ def sync_notebooks(
                 continue
             # Supply every source on upgrade/rename and for cached diagrams.
             # Only changed pages are transcribed by the model.
-            svg_paths = []
-            for i in range(len(rm_pages)):
-                svg_content = _render_rm_to_svg(rm_pages[i])
+            svg_paths: list[Path | None] = [None] * len(rm_pages)
+            for i in selected_indices:
+                rm_file = rm_pages[i]
+                assert rm_file is not None
+                if selected_mode and rm_file.suffix == ".pdf":
+                    svg_paths[i] = rm_file
+                    continue
+                svg_content = _render_rm_to_svg(rm_file)
                 svg_path = tmp_dir / f"page_{i+1}.svg"
                 svg_path.write_text(svg_content)
-                svg_paths.append(svg_path)
+                svg_paths[i] = svg_path
 
             # Transcribe only changed pages, reuse cached markdown for others
             page_markdowns = {}
             prev_markdown = ""
-            for i in range(len(rm_pages)):
+            for i in selected_indices:
+                page_path = svg_paths[i]
+                assert page_path is not None
                 if i in changed_indices:
                     # D1: Skip blank pages
-                    if blank_detect and is_blank_page(svg_paths[i]):
+                    if blank_detect and page_path.suffix == ".svg" and is_blank_page(page_path):
                         log.info("Skipping page %d/%d (blank)", i + 1, len(rm_pages))
                         page_markdowns[str(i)] = ""
                         continue
                     log.info("Transcribing page %d/%d (changed)", i + 1, len(rm_pages))
                     # A1: Build context for this page
-                    ctx = _build_page_context(nb, i, len(rm_pages), prev_markdown=prev_markdown)
-                    md = transcribe_page(client, svg_paths[i], model, context=ctx, system_prompt=nb_prompt)
-                    # Fix diagram page references to use page=1 since we send one at a time
-                    md = md.replace("page=1", f"page={i+1}")
+                    ctx = _build_page_context(nb, i, len(rm_pages), prev_markdown="" if selected_mode else prev_markdown)
+                    if selected_mode and page_path.suffix == ".pdf":
+                        md = transcribe_pdf(client, page_path, model, context=ctx,
+                                            system_prompt=nb_prompt or SINGLE_PAGE_PROMPT)
+                    else:
+                        md = transcribe_page(client, page_path, model, context=ctx, system_prompt=nb_prompt)
+                    # Each selected input is one page, regardless of its original number.
+                    md = _renumber_diagrams(md, i + 1) if selected_mode else md.replace("page=1", f"page={i+1}")
                     page_markdowns[str(i)] = md
                 else:
                     log.info("Reusing cached transcription for page %d/%d", i + 1, len(rm_pages))
-                    page_markdowns[str(i)] = cached_pages[str(i)]["markdown"]
+                    md = cached_pages[str(i)]["markdown"]
+                    page_markdowns[str(i)] = _renumber_diagrams(md, i + 1) if selected_mode else md
                 prev_markdown = page_markdowns[str(i)]
 
             # Assemble full markdown
-            all_parts = [page_markdowns[str(i)] for i in range(len(rm_pages))]
+            all_parts = [(f"## Page {i+1}\n\n" if selected_mode else "") + page_markdowns[str(i)] for i in selected_indices]
             markdown = "\n\n---\n\n".join(all_parts)
 
             # Extract and crop any diagram regions
@@ -1752,8 +1959,10 @@ def sync_notebooks(
                     existing_tags = nb.get("tags", [])
                     nb["tags"] = list({*existing_tags, *inferred})
 
+            if selected_mode:
+                nb["selected_pages"] = [i + 1 for i in selected_indices]
             source_files = save_source_pages(vault_path, nb, svg_paths, changed_indices=set(changed_indices))
-            nb["page_count"] = len(rm_pages)
+            nb["page_count"] = len(selected_indices)
             note_path = write_obsidian_note(vault_path, nb, markdown, source_files, tasks=tasks, expected_hash=nb_state.get("output_hash"))
             log.info("Wrote %s (%d chars, %d/%d pages transcribed)",
                      note_path, len(markdown), len(changed_indices), len(rm_pages))
@@ -1761,12 +1970,13 @@ def sync_notebooks(
 
             # Save per-page state
             new_pages = {}
-            for i in range(len(rm_pages)):
+            for i in selected_indices:
                 new_pages[str(i)] = {
                     "hash": page_hashes[str(i)],
                     "markdown": page_markdowns[str(i)],
+                    **({"id": page_ids[i], "context_free": True} if selected_mode else {}),
                 }
-            state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pages": new_pages, "output_hash": _hash_file(note_path)}
+            state[nb["id"]] = {"version": nb["version"], "path": nb["path"], "name": nb["name"], "modified": nb.get("modified"), "pages": new_pages, "output_hash": _hash_file(note_path), **({"selection": selection_state} if selected_mode else {})}
             save_state(state_file, state)
         except Exception as exc:
             log.error("Failed to process %s", nb["name"], exc_info=True)
@@ -2033,7 +2243,18 @@ def main():
     parser.add_argument("--no-blank-detect", action="store_true", help="Disable blank page detection (skip API calls for empty pages)")
     parser.add_argument("--extract-tasks", action="store_true", help="Extract action items from transcriptions using Haiku")
     parser.add_argument("--infer-tags", action="store_true", help="Infer semantic tags from transcriptions using Haiku")
+    parser.add_argument("--include-tag", action="append", default=[], help="Include ANY native tag (repeatable)")
+    parser.add_argument("--exclude-tag", action="append", default=[], help="Exclude native tag; wins over includes (repeatable)")
+    parser.add_argument("--pages", type=parse_page_ranges, help="1-based pages/closed ranges, e.g. 1,3-5")
     args = parser.parse_args()
+
+    selection = None
+    if args.include_tag or args.exclude_tag or args.pages is not None:
+        if any(not value.strip() for value in args.include_tag + args.exclude_tag):
+            parser.error("tag filters cannot be empty/whitespace")
+        selection = Selection(tuple(args.include_tag), tuple(args.exclude_tag), args.pages or ())
+        if args.merge_states or args.retag or args.list_only:
+            parser.error("selection cannot be combined with --merge-states, --retag or --list-only")
 
     if args.dry_run and (args.merge_states or args.retag or args.list_only):
         parser.error("--dry-run cannot be combined with --merge-states, --retag or --list-only")
@@ -2066,6 +2287,11 @@ def main():
         Path(args.list_only).write_text(json.dumps(notebooks, indent=2))
         log.info("Saved notebook list to %s", args.list_only)
         return
+
+    # Lists loaded from JSON obey the same folder restriction as live discovery.
+    watch = config["watch_path"].rstrip("/")
+    if watch:
+        notebooks = [nb for nb in notebooks if nb["path"] == watch or nb["path"].startswith(watch + "/")]
 
     # Filter ignored notebooks
     ignore_patterns = load_ignore_patterns()
@@ -2131,6 +2357,7 @@ def main():
         infer_tags_enabled=args.infer_tags,
         blank_detect=not args.no_blank_detect,
         custom_prompts=custom_prompts or None,
+        selection=selection,
     )
 
     # Write sync log (skip for dry-run or empty results)

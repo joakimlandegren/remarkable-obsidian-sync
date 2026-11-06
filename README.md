@@ -115,6 +115,65 @@ uv run python remarkable_to_obsidian.py
 RM_WATCH_PATH="/Work/Meeting Notes" uv run python remarkable_to_obsidian.py
 ```
 
+### Select notebooks and pages by native tags
+
+```bash
+# Within the usual watched folder, include either tag and exclude private pages
+RM_WATCH_PATH="/Work" uv run python remarkable_to_obsidian.py \
+  --include-tag work --include-tag meeting --exclude-tag private
+
+# Intersect native tag selection with original page numbers
+uv run python remarkable_to_obsidian.py --include-tag work --pages 1,3-5
+
+# Ordinary PDF page ranges (no native tag filters)
+uv run python remarkable_to_obsidian.py --pages 2-4
+
+# Download/model/write-free preview; page-tag selection remains unresolved
+uv run python remarkable_to_obsidian.py --include-tag work --dry-run
+```
+
+`--include-tag` and `--exclude-tag` are repeatable. Matching trims leading/trailing
+whitespace and uses Unicode case-insensitive matching; internal whitespace is
+literal. Includes match **ANY** tag; exclusions always win. Native notebook tags
+apply to every page; native `pageTags` apply only to their associated `pageId`.
+No includes means all available pages minus exclusions. `--pages` accepts only
+positive 1-based numbers and closed ascending ranges, separated by commas. Ranges
+intersect tags and available pages; duplicates never duplicate output. Page order
+and original numbers are retained in headings, context and `selected_pages`.
+Folder/watch-path and `.sync_ignore` restrictions still apply, including JSON
+notebook lists. Inferred, frontmatter and built-in tags are never selection evidence.
+
+Filtering happens **before AI processing, not necessarily before downloading**:
+the full native archive may be downloaded locally to read `.content`. Only
+selected pages reach transcription, task/tag inference, source embeds and diagram
+assets. This is not an offline mode: discovery/downloads use reMarkable cloud and
+selected content uses the configured model backend. Preview does neither download
+nor model calls and reports unresolved selection rather than guessing page tags.
+
+Supported native orderings are legacy `.content.pages` ID arrays and live
+`cPages.pages` with unique `idx.value` ordering indices (lexicographic order).
+Missing/ambiguous order, tag associations or selected stroke files fail closed.
+PDF ranges create single-page subsets before model submission and source export.
+Ordinary PDF files and unannotated PDF archives are supported; archives with page
+IDs must provide an explicit identity `redirectionPageMap` and matching counts.
+Annotated/reordered PDFs, PDF native-tag filters, EPUBs and unsupported native
+metadata formats return errors, never fall back to whole-document processing.
+
+No matching pages is a skip, not an empty overwrite or successful source-state
+advance. Selection runs inspect metadata even if source version/time is unchanged.
+Safe context-free transcription is reused by native page ID and content hash;
+ordinary/full-sync cache is not trusted across an exclusion boundary. Selective
+transcription omits previous-page text so changing selection cannot leak cached
+excluded context. Returning to full sync without flags rebuilds complete output;
+previously selective notebooks continue metadata inspection and context-free
+caching. Notebooks never selectively synced keep ordinary sync behavior.
+
+Selection is **not retroactive erasure**: old notes on no-match skips and old
+attachments remain on disk, including previously exported excluded content.
+Successful nonempty selections replace only an unedited managed note; edit and
+legacy-note conflicts leave output/source state untouched. Selection cannot be
+combined with `--retag`, `--merge-states` or `--list-only`.
+
 ### Re-tag without re-transcribing
 
 Update tags from reMarkable metadata without re-running transcription:
