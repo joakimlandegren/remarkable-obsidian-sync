@@ -1,3 +1,4 @@
 anthropic[vertex]>=0.40.0
 cairosvg>=2.7.0
+httpx>=0.28.1
 rmscene>=0.7.0

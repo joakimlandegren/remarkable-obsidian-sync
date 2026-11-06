@@ -17,7 +17,7 @@ Sync handwritten [reMarkable](https://remarkable.com/) notebooks to [Obsidian](h
 - **Python 3.12+**
 - **[uv](https://docs.astral.sh/uv/)** for dependency management
 - **[rmapi](https://github.com/ddvk/rmapi)** for reMarkable cloud access (Go binary)
-- **A model backend**: Spotify's Hendrix AI Gateway (GLM, recommended), the Claude Code CLI, an Anthropic API key, or Google Cloud Vertex AI. See [Backends](#backends).
+- **A model backend**: an explicitly selected OpenAI-compatible vision server, Hendrix AI Gateway, Claude CLI, Anthropic API or Vertex AI. See [Configuration and providers](#configuration-and-providers).
 
 ### Install rmapi
 
@@ -44,51 +44,116 @@ cd remarkable-obsidian-sync
 uv sync
 ```
 
-## Configuration
+## Configuration and providers
 
-Create a `.env` file in the project root (gitignored). The script loads it automatically without overriding existing env vars:
+Use environment variables or the existing gitignored `.env` beside the script
+(loaded without overriding the environment). There is no provider UI or new config
+format. Model-processing runs now require an explicit `RM_BACKEND` and `RM_MODEL`.
+Missing/unknown providers, contradictory selectors and empty models fail closed
+before model-run discovery, downloads or output writes. Validation never probes
+endpoints or downloads models.
 
 ```bash
-# .env
+# Local chat-completions server: replace the model identifier with one it serves.
+RM_BACKEND=openai-compatible
+RM_MODEL=your-literal-vision-model-id
+RM_OPENAI_BASE_URL=http://127.0.0.1:8080/v1
 RMAPI_BIN=/path/to/rmapi
 OBSIDIAN_VAULT=/path/to/your/obsidian/vault
-
-# Self-hosted GLM via the Hendrix AI Gateway (recommended)
-RM_BACKEND=hendrix
-RM_MODEL=glm-5-3-flash
 ```
 
-### Backends
+The adapter appends `/chat/completions` to the supplied base URL. It supports only
+chat-completions text and ordered `image_url` data URLs, including PDF pages
+rendered to PNG at 150 dpi. The endpoint and chosen model must support that vision
+contract and `max_tokens`; this is not a universal OpenAI/API compatibility claim.
+No endpoint probes, fallback providers or local-to-cloud fallback are performed.
 
-`RM_BACKEND` selects where transcription requests go. All backends speak the Anthropic Messages format, so the rest of the pipeline is identical.
-
-| Backend | Setting | Auth | Notes |
-|---|---|---|---|
-| Hendrix AI Gateway | `RM_BACKEND=hendrix` | `HENDRIX_API_KEY` | Self-hosted GLM on Spotify compute. Far cheaper than Claude for OCR. |
-| Claude Code CLI | `RM_BACKEND=claude-cli` | Local `claude` login | Shells out to `claude -p` per request. Each call starts a full session, which is expensive at volume. |
-| Vertex AI | `CLAUDE_CODE_USE_VERTEX=1` | GCP credentials | Requires `ANTHROPIC_VERTEX_PROJECT_ID`. |
-| Anthropic API | *(default)* | `ANTHROPIC_API_KEY` | |
-
-**Hendrix / GLM details.** Use `glm-5-3-flash`: plain `glm-5-3` can't read images. The gateway rejects PDF `document` blocks, so the client renders each PDF page to a PNG (150 dpi, via PyMuPDF) before sending. Thinking is disabled because GLM otherwise spends the whole `max_tokens` budget reasoning on long PDFs and returns no text. The gateway is internal, so runs off VPN fail with a DNS error; those notebooks keep their old state and are retried on the next run.
-
-`sync.sh` reads `HENDRIX_API_KEY` from `~/.zshrc` because launchd doesn't load your shell profile.
-
-All configuration variables can also be set as environment variables:
-
-| Variable | Default | Description |
+| `RM_BACKEND` | Credentials / route | Consent |
 |---|---|---|
-| `OBSIDIAN_VAULT` | `~/obsidian-vault` | Path to your Obsidian vault |
-| `RMAPI_BIN` | `rmapi` | Path to the rmapi binary |
-| `RM_WATCH_PATH` | `/` | reMarkable folder to sync (e.g., `/Work/Notes`) |
-| `RM_BACKEND` | *(unset)* | `hendrix` or `claude-cli`; see [Backends](#backends) |
-| `RM_MODEL` | `claude-opus-4-6` | Model to use for transcription (`glm-5-3-flash` for Hendrix) |
-| `RM_STATE_FILE` | `~/.remarkable_sync_state.json` | Path to the sync state file |
-| `HENDRIX_API_KEY` | *(required for Hendrix)* | Hendrix AI Gateway key |
-| `RM_HENDRIX_URL` | `https://hendrix-genai.spotify.net/taskforce/glm-5-3-flash` | Gateway route for the Hendrix backend |
-| `ANTHROPIC_API_KEY` | *(required unless using Vertex)* | Your Anthropic API key |
-| `CLAUDE_CODE_USE_VERTEX` | *(unset)* | Set to `1` to use Vertex AI instead |
-| `ANTHROPIC_VERTEX_PROJECT_ID` | *(required for Vertex)* | GCP project ID |
-| `CLOUD_ML_REGION` | `europe-west1` | GCP region for Vertex AI |
+| `openai-compatible` | Required `RM_OPENAI_BASE_URL`; optional env-only `RM_OPENAI_API_KEY` | No remote opt-in only at strict literal loopback |
+| `anthropic` | `ANTHROPIC_API_KEY` or SDK auth token; Anthropic Messages | `RM_ALLOW_REMOTE_LLM=1` |
+| `vertex` | GCP credentials, `ANTHROPIC_VERTEX_PROJECT_ID`, optional `CLOUD_ML_REGION` (default `europe-west1`) | `RM_ALLOW_REMOTE_LLM=1` |
+| `hendrix` | `HENDRIX_API_KEY`; optional `RM_HENDRIX_URL` (existing gateway default retained) | `RM_ALLOW_REMOTE_LLM=1` |
+| `claude-cli` | Existing Claude CLI login; optional `RM_CLAUDE_BIN` | `RM_ALLOW_REMOTE_LLM=1` |
+
+All existing backends count as remote, including a self-hosted Hendrix gateway.
+Only the literal value `1` grants remote consent, before SDK/auth construction or
+CLI lookup/spawn and before model-run discovery/download/output mutation.
+For example, after configuring credentials and choosing an available model:
+
+```bash
+RM_BACKEND=anthropic RM_MODEL=your-literal-vision-model-id RM_ALLOW_REMOTE_LLM=1 \
+  uv run python remarkable_to_obsidian.py --pages 1-2
+```
+
+For OpenAI-compatible local inference, only `http(s)://127.0.0.1` and
+`http(s)://[::1]` with valid optional ports and API paths qualify. DNS aliases
+(including `localhost`), ambiguous/encoded authorities, userinfo, query strings
+and fragments are rejected. Non-loopback endpoints require HTTPS and remote
+consent. Existing SDK endpoint overrides also require HTTPS. HTTP adapters ignore
+environment proxies and do not follow redirects, so redirects cannot forward
+prompts or keys. HTTP timeouts are finite (60 seconds per operation); CLI timeout
+is 900 seconds. No automatic HTTP retries; diagram validation may request up to
+three conversions on the same provider/model.
+
+`RM_TASK_MODEL`, `RM_TAG_MODEL` and `RM_DIAGRAM_MODEL` independently override the
+main model for task extraction, tag inference and diagram classification/conversion
+(including retries). Absent overrides inherit `RM_MODEL`; all use the same selected
+provider. Supplied empty/whitespace/control-character model IDs are rejected.
+Identifiers are otherwise passed literally, including CLI date suffixes; Vertex
+IDs are restricted to letters, digits, `.`, `_`, `@` and `-` because the SDK puts
+them into a URL path. Unsupported model IDs fail rather than being guessed or
+rewritten. Optional API credentials are environment-only, never CLI arguments.
+
+Other unchanged variables: `RM_WATCH_PATH` defaults to `/`; `RM_STATE_FILE` defaults
+to `~/.remarkable_sync_state.json`; `OBSIDIAN_VAULT` defaults to `~/obsidian-vault`;
+`RMAPI_BIN` defaults to `rmapi`. Existing Hendrix URL default is
+`https://hendrix-genai.spotify.net/taskforce/glm-5-3-flash`.
+
+### Deliberate migration
+
+Old remote users must now choose `RM_BACKEND`, set `RM_MODEL`, and explicitly
+consent with `RM_ALLOW_REMOTE_LLM=1`. The sole legacy mapping is
+`CLAUDE_CODE_USE_VERTEX=1` without `RM_BACKEND`, which selects Vertex with a
+migration warning (still requiring a model and consent). Contradictory selectors
+are errors; remove the legacy variable when switching providers. Task/tag defaults
+are no longer hardcoded Haiku: inheriting the main model can change cost/quality.
+Provider/model changes do not invalidate transcription/PDF caches or automatically
+reprocess existing notes. Existing scheduling scripts are not changed here and
+must receive the same explicit environment before a model run can proceed.
+
+`--dry-run`, `--list-only`, `--retag` and `--merge-states` never construct model
+clients and need no model consent/configuration. List/preview discovery and retag
+can still contact reMarkable cloud; retag/list/merge can write their normal outputs.
+Preview remains download/model/write-free.
+
+### Privacy and limits
+
+- This is not direct-device/offline ingestion. Discovery and downloads use the
+  reMarkable cloud even with local inference. Full archives can be downloaded
+  before page/tag selection; only selected pages/PDF subsets reach model processing.
+- Model submissions include page images or PDF content, notebook name/path/page
+  context, custom prompts, diagram crops, and optional task/tag markdown. Ordinary
+  full sync can include up to 300 characters of previous-page transcription;
+  selected mode omits previous-page text and rejects old context-bearing cache.
+  Autolinking can add matching vault titles to markdown before task/tag inference.
+- A loopback destination does not establish that its server stays local: the
+  server may forward requests remotely. Inspect its configuration and policies.
+  Provider retention, training use and server-side logs are outside this tool's
+  guarantees; remote consent does not establish a retention policy.
+- State JSON caches plaintext transcription. Notes, source attachments, diagram
+  assets and logs are plaintext and may be copied by vault/cloud sync. The sync
+  log includes notebook metadata, but new errors use fixed sanitized diagnostics,
+  not raw upstream bodies/stderr/URLs/keys/exception chains. SDK HTTP/request
+  logging is suppressed. Old log entries and old excluded attachments remain.
+- CLI prompts travel through stdin, not process arguments. Selected attachments
+  are temporary plaintext files read by the CLI. Known unrelated API credentials
+  and provider selectors are scrubbed from its environment; this is not complete
+  process isolation. The CLI's own persisted settings, tool access, network behavior
+  and retention are not sandboxed by this change. Configure/review that runtime
+  separately; HTTP-adapter proxy/redirect controls do not control CLI internals.
+- Temporary removal is best effort, not secure erasure. There is no encryption,
+  retention cleanup, retroactive erasure or automatic reprocessing in this feature.
 
 ## Usage
 
@@ -184,7 +249,7 @@ uv run python remarkable_to_obsidian.py --retag
 
 ### Task extraction and tag inference
 
-Optionally extract action items or infer semantic tags from transcriptions using a lightweight model:
+Optionally extract action items or infer semantic tags using the selected provider and task/tag models:
 
 ```bash
 # Extract action items (inserted as task lists in each note)
@@ -363,7 +428,7 @@ Edit `sync.sh` to adjust the time window.
 ## Running tests
 
 ```bash
-uv run pytest tests/test_sync.py -v
+uv run pytest tests -v
 ```
 
 ## License

@@ -694,6 +694,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic", extra = ["vertex"] },
     { name = "cairosvg" },
+    { name = "httpx" },
     { name = "pillow" },
     { name = "pymupdf" },
     { name = "rmscene" },
@@ -708,6 +709,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", extras = ["vertex"], specifier = ">=0.40.0" },
     { name = "cairosvg", specifier = ">=2.7.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "pymupdf", specifier = ">=1.24.0" },
     { name = "rmscene", specifier = ">=0.7.0" },
